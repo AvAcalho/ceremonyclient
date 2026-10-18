@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, advance_age, recovery, recovery_summary, sealed, seal_summary};
+use super::super::local_execution::{local_execution_state, execution_label, advance_age, recovery, recovery_summary, sealed, seal_summary};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -13,7 +13,6 @@ use ratatui::{
     Frame,
 };
 
-use super::super::epoch::ThresholdUnit;
 #[cfg(test)]
 use super::super::format_quil_daily_round;
 use super::model::*;
@@ -53,8 +52,8 @@ fn ring_color(ring: u32) -> Color {
 fn status_color(name: &str) -> Color {
     match name.to_lowercase().as_str() {
         "active" => SUCCESS,
-        "joining" => PRIMARY,
-        "bound" | "leaving" | "paused" | "re-confirm!" | "expiredjoin" | "expiredleave" => WARNING,
+        "joining" | "activating" => PRIMARY,
+        "bound" | "leaving" | "departing" | "paused" | "re-confirm!" | "expiredjoin" | "expiredleave" => WARNING,
         "rejected" | "kicked" => ERROR,
         _ => HELP,
     }
@@ -186,9 +185,10 @@ fn printed_width(s: &str) -> usize {
 ///
 /// Right-justifying aligns a column on its tail, which is what you want when
 /// the tail is the part being compared. Default Action always carries a
-/// threshold, so its `@f804960`s line up and the eye reads straight down
-/// them. Next Action does not: `(pause|leave)` has no threshold at all, and
-/// aligned on the tail it lands under the middle of `(reject|confirm)@f804960`
+/// threshold, so its `in 512f`s (or `@f804960`s) line up and the eye reads
+/// straight down them. Next Action does not: `(pause|leave)` has no threshold
+/// at all, and aligned on the tail it lands under the middle of
+/// `(reject|confirm)@f804960`
 /// — the column stops looking like one column. Left is the only edge its
 /// values share. Filters likewise align on their prefix.
 fn alloc_left_aligned(col: usize) -> bool {
@@ -500,11 +500,7 @@ fn header_kpis(m: &Model) -> Vec<Line<'static>> {
         ("Peer ID", peer),
         ("Strategy", strategy.into()),
         ("Seniority", format!("Seniority: {}", m.seniority)),
-        ("Global", if !compact {
-            format!("Global: f{} | e{}", m.last_received_frame, super::super::epoch::epoch_for_frame(m.last_received_frame, m.epoch_length))
-        } else if m.threshold_unit == ThresholdUnit::Epochs {
-            format!("Global: e{}", super::super::epoch::epoch_for_frame(m.last_received_frame, m.epoch_length))
-        } else { format!("Global: f{}", m.last_received_frame) }),
+        ("Global", global_kpi(m)),
         ("Global interval", format!("{} [s {}]: {}", if compact { "Global" } else { "Global interval" }, m.global_interval_labels(), interval_values(m, m.node_global_cadence.as_ref(), m.global_interval_mask()))),
         ("World size", format!("{} [GB]: {world}", if compact { "World" } else { "World size" })),
         ("RPC", rpc_text),
@@ -514,11 +510,48 @@ fn header_kpis(m: &Model) -> Vec<Line<'static>> {
     // Retry evidence stays visible even when the operator hides the ordinary RPC KPI.
     if m.consecutive_failures > 0 {
         if let Some(t) = m.last_fetch_success {
-            blocks.push(Line::from(format!("RPC retrying | Status age {} | Failed retries {}",
+            blocks.push(Line::from(format!("RPC retrying | status age {} | failed retries {}",
                 if t.elapsed().as_secs() >= 60 { ">60s" } else { "<60s" }, m.consecutive_failures)));
         }
     }
     blocks
+}
+
+fn global_kpi(m: &Model) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    global_kpi_at(m, now)
+}
+
+/// The Global KPI at wall-clock `now` (UNIX seconds): the received GLOBAL
+/// head, its epoch and the frames to the next epoch boundary, the selected
+/// fields joined by ` | `. The time to the boundary is a `~` estimate from the
+/// measured GLOBAL interval, absent without one; expanded mode adds the UTC
+/// clock time it falls at.
+fn global_kpi_at(m: &Model, now: u64) -> String {
+    use super::super::epoch::{epoch_for_frame, fmt_estimate, next_epoch_boundary};
+    let frame = m.last_received_frame;
+    if frame == 0 { return "Global: -".into(); }
+    let compact = m.compact_actions;
+    let epoch = epoch_for_frame(frame, m.epoch_length);
+    let left = next_epoch_boundary(frame, m.epoch_length) - frame;
+    let fields = [
+        if compact { format!("f{frame}") } else { format!("frame {frame}") },
+        if compact { format!("e{epoch}") } else { format!("epoch {epoch}") },
+        match (compact, m.global_seconds_per_frame()) {
+            (true, None) => format!("next {left}f"),
+            (true, Some(spf)) => format!("next {left}f ~{}", fmt_estimate(left as f64 * spf)),
+            (false, None) => format!("next boundary in {left} frames"),
+            (false, Some(spf)) => {
+                let seconds = left as f64 * spf;
+                // The clock time of the rounded estimate, so the two agree.
+                let at = now + (seconds.max(0.0) / 60.0).round() as u64 * 60;
+                format!("next boundary in {left} frames, ~{} (~{:02}:{:02} UTC)", fmt_estimate(seconds), at / 3600 % 24, at / 60 % 60)
+            }
+        },
+    ];
+    let mask = m.global_field_mask();
+    let shown: Vec<_> = fields.into_iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, f)| f).collect();
+    format!("Global: {}", shown.join(" | "))
 }
 
 /// Only operator actions have shortcuts; automatic defaults keep their names.
@@ -529,7 +562,7 @@ fn next_action_text(m: &Model, hint: &super::super::epoch::ActionHint) -> String
             hint.label = hint.label.replace(name, key);
         }
     }
-    hint.render(m.threshold_unit, m.epoch_length)
+    hint.render(m.threshold_unit, m.threshold_clock())
 }
 
 #[cfg(test)]
@@ -568,12 +601,24 @@ fn worker_counts_line(m: &Model) -> Line<'static> {
         None => ("?".into(), "?".into()),
     };
     if m.compact_actions {
-        Line::from(format!("Workers: Run {} | Assigned {}{}", m.running_workers, m.allocated_workers,
-            if manual == "0" { String::new() } else { format!(" | Manual {manual}") }))
+        Line::from(format!("Workers: run {} | assigned {}{}", m.running_workers, m.allocated_workers,
+            if manual == "0" { String::new() } else { format!(" | manual {manual}") }))
     } else {
-        Line::from(format!("Workers: Running {} | Assigned {} | Auto {} | Manual {}", m.running_workers, m.allocated_workers, automatic, manual))
+        Line::from(format!("Workers: running {} | assigned {} | auto {} | manual {}", m.running_workers, m.allocated_workers, automatic, manual))
     }
 }
+
+/// Row status, then its compact and expanded label in the `Status` KPI.
+const STATUS_KPI_LABELS: [(&str, &str, &str); 14] = [
+    ("active", "active", "active"), ("paused", "paused", "paused"),
+    ("joining", "join", "joining"), ("activating", "activ", "activating"),
+    ("leaving", "leave", "leaving"), ("departing", "depart", "departing"),
+    ("bound", "bound", "bound"), ("idle", "idle", "idle"),
+    ("expiredJoin", "join expired", "expired joining"),
+    ("expiredLeave", "leave expired", "expired leaving"),
+    ("re-confirm!", "reconfirm", "reconfirm"), ("rejected", "rejected", "rejected"),
+    ("kicked", "kicked", "kicked"), ("unknown", "unknown", "unknown"),
+];
 
 fn allocation_status_kpi(m: &Model) -> String {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -590,15 +635,7 @@ fn allocation_status_kpi(m: &Model) -> String {
         *counts.entry(label).or_default() += 1;
     }
     let mut fields = Vec::new();
-    for (key, compact, expanded) in [
-        ("active", "Active", "Active"), ("paused", "Paused", "Paused"),
-        ("joining", "Join", "Joining"), ("leaving", "Leave", "Leaving"),
-        ("bound", "Bound", "Bound"), ("idle", "Idle", "Idle"),
-        ("expiredJoin", "Join expired", "Expired joining"),
-        ("expiredLeave", "Leave expired", "Expired leaving"),
-        ("re-confirm!", "Reconfirm", "Reconfirm"), ("rejected", "Rejected", "Rejected"),
-        ("kicked", "Kicked", "Kicked"), ("unknown", "Unknown", "Unknown"),
-    ] {
+    for (key, compact, expanded) in STATUS_KPI_LABELS {
         let count = counts.get(key).copied().unwrap_or(0);
         if count != 0 || !m.compact_actions {
             fields.push(format!("{} {count}", if m.compact_actions { compact } else { expanded }));
@@ -684,11 +721,11 @@ fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
     let change_text = reward_total(m, sorted, 2);
     let reward = if m.compact_actions {
         let breakdown = paused_unknown || change_unknown || paused != BigInt::from(0) || change != BigInt::from(0);
-        let mut text = format!("[~Q/d {}] {}{now}", m.reward_labels(), if breakdown { "Now " } else { "" });
-        if paused_unknown || paused != BigInt::from(0) { text += &format!(" | Paused {paused_text}"); }
+        let mut text = format!("[~Q/d {}] {}{now}", m.reward_labels(), if breakdown { "now " } else { "" });
+        if paused_unknown || paused != BigInt::from(0) { text += &format!(" | paused {paused_text}"); }
         if change_unknown || change != BigInt::from(0) { text += &format!(" | Δ {change_text}"); }
         text
-    } else { format!("Reward [~Q/d {}]: Now {now} | Paused {paused_text} | Delta {change_text}", m.reward_labels()) };
+    } else { format!("Reward [~Q/d {}]: now {now} | paused {paused_text} | delta {change_text}", m.reward_labels()) };
     let mut blocks = vec!["Allocations".to_string()];
     for (name, text) in [
         ("Workers", worker_counts_line(m).to_string()),
@@ -749,6 +786,23 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
     if materialized == 0 && latest == 0 { "-".into() } else { materialized.to_string() }
 }
 
+/// The ProverPhases cell: the shard's provers by lifecycle phase, symbols in
+/// compact mode and names in expanded mode. Zero fields are omitted except
+/// active, so an empty shard reads `a0`; unreported counts read `-`. A
+/// trailing `!` marks halt risk for `warning_slot`.
+fn prover_phases_cell(m: &Model, counts: Option<&quil_types::proto::node::ShardProverCounts>, size: &BigInt) -> String {
+    let Some(c) = counts else { return "-".into(); };
+    let fields = [(c.active, "a", "active"), (c.joining, "j", "joining"), (c.activating, "+", "activating"),
+        (c.leaving, "l", "leaving"), (c.departing, "-", "departing"), (c.paused, "p", "paused")];
+    let shown = fields.iter().enumerate().filter(|(i, (count, ..))| *i == 0 || *count > 0).map(|(_, field)| field);
+    let text = if m.compact_actions {
+        shown.map(|(count, symbol, _)| format!("{symbol}{count}")).collect::<Vec<_>>().join(" ")
+    } else {
+        shown.map(|(count, _, name)| format!("{count} {name}")).collect::<Vec<_>>().join(", ")
+    };
+    if prover_halt_risk(counts, size) { text + "!" } else { text }
+}
+
 /// The printed text of one allocations cell. Sizing and rendering both go
 /// through here. `fw` is the Filter column's width, which is a budget rather
 /// than a measurement — pass 0 when measuring the other columns.
@@ -772,7 +826,8 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         13 => a.mode().to_string(),
         14 => next_action_text(m, &a.next_action),
         16 => interval_values(m, m.node_app_cadence.get(&a.filter), m.interval_mask()),
-        _ => a.default_action.render(m.threshold_unit, m.epoch_length),
+        ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
+        _ => a.default_action.render(m.threshold_unit, m.threshold_clock()),
     }
 }
 
@@ -785,7 +840,7 @@ fn warning_slot(text: &str, color_coding: bool) -> String {
 }
 
 pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
-    if !matches!(a.status_name.as_str(), "joining" | "leaving") { return a.status_name.clone(); }
+    if !matches!(a.status_name.as_str(), "joining" | "activating" | "leaving" | "departing") { return a.status_name.clone(); }
     let (symbol, name) = match a.allocation_reason.as_deref() {
         Some("$") => ("$", "reward"), Some("H") => ("H", "halt risk"),
         Some("S") => ("S", "split"), Some("G") => ("G", "merge"), Some("T") => ("T", "retired"),
@@ -798,12 +853,12 @@ pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
 
 fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     let text = alloc_cell(m, a, col, fw);
-    if matches!(col, 6 | 7 | 12) { warning_slot(&text, m.color_coding) } else { text }
+    if matches!(col, 6 | 7 | 12 | ALLOC_PROVER_PHASES_COL) { warning_slot(&text, m.color_coding) } else { text }
 }
 
 fn avail_display_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
     let text = avail_cell(m, s, col, fw);
-    if col == 9 { warning_slot(&text, m.color_coding) } else { text }
+    if matches!(col, 9 | AVAIL_PROVER_PHASES_COL) { warning_slot(&text, m.color_coding) } else { text }
 }
 
 fn alloc_marker(m: &Model, a: &AllocationRow) -> &'static str {
@@ -830,7 +885,7 @@ fn alloc_header(m: &Model, idx: usize) -> String {
     if idx == 8 && m.compact_actions && m.header_kpi_visible("Allocation GLOBAL snapshot") {
         text += snapshot_suffix(m, m.allocations.iter().map(|a| a.global_head.as_ref())).trim_start();
     }
-    if matches!(idx, 6 | 12) { warning_slot(&text, true) } else { text }
+    if matches!(idx, 6 | 12 | ALLOC_PROVER_PHASES_COL) { warning_slot(&text, true) } else { text }
 }
 
 /// Align shared columns through Reward; local and peer context use their own labels.
@@ -858,7 +913,8 @@ fn alloc_col_widths(
         ColumnSizing::Dynamic => alloc_widths_measured(m, content_width, sorted),
         ColumnSizing::Fixed => alloc_widths_fixed(m, content_width, sorted),
     };
-    if (0..widths.len()).all(|col| m.alloc_column_visible(col)) { return (widths, fw); }
+    // The sizers already leave a hidden ProverPhases out.
+    if (0..widths.len()).all(|col| m.alloc_column_visible(col) || col == ALLOC_PROVER_PHASES_COL) { return (widths, fw); }
     for (col, width) in widths.iter_mut().enumerate() { if !m.alloc_column_visible(col) { *width = 0; } }
     let cap = if m.column_sizing == ColumnSizing::Fixed { FILTER_WIDTH }
         else { filter_cap(&alloc_header(m, 1), sorted.iter().map(|a| printed_width(&a.filter_hex))) };
@@ -882,6 +938,7 @@ fn alloc_widths_measured(
     let n = ALLOC_COL_NAMES.len();
     let mut widths: Vec<usize> = (0..n)
         .map(|c| {
+            if c == ALLOC_PROVER_PHASES_COL && !m.alloc_column_visible(c) { return 0; }
             col_width(
                 &alloc_header(m, c),
                 sorted
@@ -895,7 +952,7 @@ fn alloc_widths_measured(
         &alloc_header(m, 1),
         sorted.iter().map(|a| printed_width(&a.filter_hex)),
     );
-    let fw = filter_width(content_width, &widths, n, cap);
+    let fw = filter_width(content_width, &widths, n - usize::from(widths[ALLOC_PROVER_PHASES_COL] == 0), cap);
     widths[1] = fw;
     (widths, fw)
 }
@@ -921,8 +978,16 @@ fn alloc_widths_fixed(
     );
     let global_head_w = fit(GLOBAL_HEAD_WIDTH.max(printed_width(&alloc_header(m, 8))), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 8, 0))));
     let status_w = fit(STATUS_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 12, 0))));
+    // Expanded relative thresholds append a time estimate past the fixed widths.
+    let next_w = fit(NEXT_ACTION_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 14, 0))));
+    let default_w = fit(DEFAULT_ACTION_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 15, 0))));
+    // The optional column has no fixed width: measured when shown, else absent.
+    let phases_w = if m.alloc_column_visible(ALLOC_PROVER_PHASES_COL) {
+        col_width(&alloc_header(m, ALLOC_PROVER_PHASES_COL), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, ALLOC_PROVER_PHASES_COL, 0))))
+    } else { 0 };
     // Whatever the wide columns took comes out of the flexible Filter column.
-    let grown = (status_w - STATUS_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
+    let grown = (status_w - STATUS_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH)
+        + (next_w - NEXT_ACTION_WIDTH) + (default_w - DEFAULT_ACTION_WIDTH) + phases_w + usize::from(phases_w > 0);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -952,9 +1017,10 @@ fn alloc_widths_fixed(
         WORKER_WIDTH,
         status_w,
         MODE_WIDTH,
-        NEXT_ACTION_WIDTH,
-        DEFAULT_ACTION_WIDTH,
+        next_w,
+        default_w,
         col_width(&alloc_header(m, 16), sorted.iter().map(|a| printed_width(&alloc_display_cell(m, a, 16, 0)))),
+        phases_w,
     ];
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -967,7 +1033,8 @@ fn alloc_widths_fixed(
             widths[col] += 1;
         }
     }
-    if m.alloc_sort_col >= 0 && (m.alloc_sort_col as usize) < widths.len() {
+    // A hidden column stays absent, even when it is the sort column.
+    if m.alloc_sort_col >= 0 && (m.alloc_sort_col as usize) < widths.len() && widths[m.alloc_sort_col as usize] > 0 {
         widths[m.alloc_sort_col as usize] += 1;
     }
     if m.compact_units {
@@ -975,7 +1042,7 @@ fn alloc_widths_fixed(
             widths[col] = col_width(&alloc_header(m, col), sorted.iter()
                 .map(|a| printed_width(&alloc_display_cell(m, a, col, 0))));
         }
-        fw = filter_width(content_width, &widths, widths.len(), FILTER_WIDTH);
+        fw = filter_width(content_width, &widths, widths.len() - usize::from(phases_w == 0), FILTER_WIDTH);
         widths[1] = fw;
     }
     (widths, fw)
@@ -1010,13 +1077,21 @@ fn local_warning(m: &Model, a: &AllocationRow) -> bool {
 }
 
 fn local_color(m: &Model, a: &AllocationRow) -> Color {
-    match m.execution_state(a.execution.as_ref()) {
+    let state = m.execution_state(a.execution.as_ref());
+    if matches!(state, "running" | "serving") && local_warning(m, a) { Color::Yellow } else { execution_color(state) }
+}
+
+fn execution_color(state: &str) -> Color {
+    match state {
         "blocked" | "stopped" => ERROR,
-        "running" | "serving" if local_warning(m, a) => Color::Yellow,
         "running" | "serving" => SUCCESS,
         _ => HELP,
     }
 }
+
+/// Every execution state an allocation row can show.
+const EXECUTION_STATES: [&str; 12] = ["starting", "syncing", "serving", "running", "closing", "handoff",
+    "waiting", "blocked", "stopped", "stale", "cached", "unknown"];
 
 fn fmt_global_head(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
     head.map(|h| format!("{}@g{}", h.frame, h.generation)).unwrap_or_else(|| "-".into())
@@ -1045,7 +1120,7 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
         "Worker bound; no live allocation reported. "
     } else { "" };
     let Some(execution) = a.execution.as_ref() else {
-        if a.status_name == "joining" { return peer_materialization_detail(a.materialized_frame, a.latest_frame); }
+        if matches!(a.status_name.as_str(), "joining" | "activating") { return peer_materialization_detail(a.materialized_frame, a.latest_frame); }
         return Line::from(Span::styled(format!("{binding_detail}Local execution details unavailable"),
             Style::new().fg(if binding_detail.is_empty() { HELP } else { WARNING })));
     };
@@ -1160,6 +1235,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                 if ci > 0 { spans.push(Span::raw(" ")); }
                 let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(m, a) }
                     else if ci == 7 && m.color_coding && m.reported_app_stalled(&a.filter) { WARNING }
+                    else if ci == ALLOC_PROVER_PHASES_COL && m.color_coding && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) { WARNING }
                     else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR }
                     else if ci == 12 && m.color_coding { status_color(&a.status_name) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
@@ -1186,6 +1262,9 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                     }
                     7 if m.color_coding && m.reported_app_stalled(&a.filter) => Span::styled(cell.clone(), Style::new().fg(WARNING)),
                     7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
+                    ALLOC_PROVER_PHASES_COL if m.color_coding && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) => {
+                        Span::styled(cell.clone(), Style::new().fg(WARNING))
+                    }
                     11 if m.color_coding => match worker_color(a.worker_id) {
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
                         None => Span::raw(cell.clone()),
@@ -1238,6 +1317,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         9 if m.reported_app_stalled(&s.filter) => "stalled!".into(),
         9 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
         11 => interval_values(m, m.node_app_cadence.get(&s.filter), m.interval_mask()),
+        AVAIL_PROVER_PHASES_COL => prover_phases_cell(m, s.prover_counts.as_ref(), &s.shard_size),
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { reward_cell(m, &s.estimated_reward, &s.filter) },
     }
 }
@@ -1266,7 +1346,7 @@ fn avail_header(m: &Model, idx: usize) -> String {
     if idx == 8 && m.compact_actions && m.header_kpi_visible("Available GLOBAL snapshot") {
         text += snapshot_suffix(m, m.available.iter().map(|s| s.global_head.as_ref())).trim_start();
     }
-    if idx == 9 { warning_slot(&text, true) } else { text }
+    if matches!(idx, 9 | AVAIL_PROVER_PHASES_COL) { warning_slot(&text, true) } else { text }
 }
 
 fn avail_col_widths(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (Vec<usize>, usize) {
@@ -1274,7 +1354,7 @@ fn avail_col_widths(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (Ve
         ColumnSizing::Dynamic => avail_widths_measured(m, content_width, sorted),
         ColumnSizing::Fixed => avail_widths_fixed(m, content_width, sorted),
     };
-    if (0..widths.len()).all(|col| m.avail_column_visible(col)) { return (widths, fw); }
+    if (0..widths.len()).all(|col| m.avail_column_visible(col) || col == AVAIL_PROVER_PHASES_COL) { return (widths, fw); }
     for (col, width) in widths.iter_mut().enumerate() { if !m.avail_column_visible(col) { *width = 0; } }
     let cap = if m.column_sizing == ColumnSizing::Fixed { FILTER_WIDTH }
         else { filter_cap(&avail_header(m, 1), sorted.iter().map(|a| printed_width(&a.filter_hex))) };
@@ -1292,6 +1372,7 @@ fn avail_widths_measured(
     let n = AVAIL_COL_NAMES.len();
     let mut widths: Vec<usize> = (0..n)
         .map(|c| {
+            if c == AVAIL_PROVER_PHASES_COL && !m.avail_column_visible(c) { return 0; }
             col_width(
                 &avail_header(m, c),
                 sorted
@@ -1305,7 +1386,7 @@ fn avail_widths_measured(
         &avail_header(m, 1),
         sorted.iter().map(|s| printed_width(&s.filter_hex)),
     );
-    let fw = filter_width(content_width, &widths, n, cap);
+    let fw = filter_width(content_width, &widths, n - usize::from(widths[AVAIL_PROVER_PHASES_COL] == 0), cap);
     widths[1] = fw;
     (widths, fw)
 }
@@ -1325,7 +1406,11 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     );
     let global_head_w = fit(GLOBAL_HEAD_WIDTH.max(printed_width(&avail_header(m, 8))), sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, 8, 0))));
     let state_w = STATE_WIDTH.max(printed_width(&avail_header(m, 9)));
-    let grown = (state_w - STATE_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
+    let phases_w = if m.avail_column_visible(AVAIL_PROVER_PHASES_COL) {
+        col_width(&avail_header(m, AVAIL_PROVER_PHASES_COL), sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, AVAIL_PROVER_PHASES_COL, 0))))
+    } else { 0 };
+    let grown = (state_w - STATE_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH)
+        + phases_w + usize::from(phases_w > 0);
     let mut fw = content_width.saturating_sub(AVAIL_FIXED_WIDTH + grown);
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -1353,6 +1438,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         state_w,
         reward_w,
         col_width(&avail_header(m, 11), sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, 11, 0)))),
+        phases_w,
     ];
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -1365,7 +1451,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
             widths[col] += 1;
         }
     }
-    if m.avail_sort_col >= 0 && (m.avail_sort_col as usize) < widths.len() {
+    if m.avail_sort_col >= 0 && (m.avail_sort_col as usize) < widths.len() && widths[m.avail_sort_col as usize] > 0 {
         widths[m.avail_sort_col as usize] += 1;
     }
     if m.compact_units {
@@ -1373,7 +1459,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
             widths[col] = col_width(&avail_header(m, col), sorted.iter()
                 .map(|s| printed_width(&avail_display_cell(m, s, col, 0))));
         }
-        fw = filter_width(content_width, &widths, widths.len(), FILTER_WIDTH);
+        fw = filter_width(content_width, &widths, widths.len() - usize::from(phases_w == 0), FILTER_WIDTH);
         widths[1] = fw;
     }
     (widths, fw)
@@ -1480,7 +1566,8 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                 let cell = &cells[c];
                 if !m.avail_column_visible(c) { continue; }
                 if c > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(c, 7 | 9) && m.reported_app_stalled(&s.filter) { WARNING } else if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
+                let color = if m.color_coding && matches!(c, 7 | 9) && m.reported_app_stalled(&s.filter) { WARNING } else if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) }
+                    else if m.color_coding && c == AVAIL_PROVER_PHASES_COL && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) { WARNING } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().enumerate().filter(|(col, _)| m.avail_column_visible(*col)).map(|(_, cell)| printed_width(cell)).sum::<usize>()
@@ -1503,6 +1590,9 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
                     7 | 9 if m.color_coding && m.reported_app_stalled(&s.filter) => Span::styled(cell, Style::new().fg(WARNING)),
                     7 | 8 if m.color_coding => Span::styled(cell, Style::new().fg(HELP)),
+                    AVAIL_PROVER_PHASES_COL if m.color_coding && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) => {
+                        Span::styled(cell, Style::new().fg(WARNING))
+                    }
                     6 | 9 if m.color_coding => {
                         let color = materialization_state_color(materialization_state(
                             s.materialized_frame,
@@ -1815,7 +1905,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
     let actions_label = if m.compact_actions { "expand" } else { "compact" };
     let refresh_label = format!("refresh {}s", m.refresh_seconds);
     let colors_label = if m.color_coding { "colors on" } else { "colors off" };
-    let units_label = if m.threshold_unit == ThresholdUnit::Epochs { "units epochs" } else { "units frames" };
+    let units_label = format!("thresholds {}", m.threshold_unit.label());
     // (key, desc, action-tag)
     let entries: [(&str, &str, &str); 24] = [
         ("tab", "switch", ""),
@@ -1836,7 +1926,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
         ("s", "sort", ""),
         ("f", if filters_active { "filter*" } else { "filter" }, "Filter"),
         ("c", colors_label, "ColorCoding"),
-        ("e", units_label, "ThresholdUnit"),
+        ("e", units_label.as_str(), "ThresholdUnit"),
         ("v", "notice level", ""),
         ("t", refresh_label.as_str(), ""),
         ("[/] {/}", "upper/lower edge", ""),
@@ -1921,7 +2011,7 @@ fn render_filter_edit_lines(m: &Model) -> (Line<'static>, Line<'static>) {
 // ── Help screen ──────────────────────────────────────────────────────────
 
 fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
-    let body = help_body();
+    let body = help_lines(area.width, m.color_coding);
     m.help_lines = body.len();
     let mut commands = wrap_actions(help_commands(), area.width);
     let footer_height = commands.len().min(usize::from(area.height.saturating_sub(3).max(1)));
@@ -1941,198 +2031,458 @@ fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     f.render_widget(Paragraph::new(commands).style(Style::new().fg(HELP)), Rect::new(area.x, area.y + area.height.saturating_sub(footer_height as u16), area.width, footer_height as u16));
 }
 
+/// One help entry; `help_lines` lays it out for a terminal width.
+#[derive(Clone, Copy)]
+enum HelpItem {
+    Blank,
+    Section(&'static str),
+    Entry(&'static str, &'static str),
+    /// One value of the entry above it, as a bulleted line in its text column.
+    Item(&'static str),
+    Note(&'static str),
+}
+
+const HELP_KEY_WIDTH: usize = 16;
+/// Two spaces, the key column and one space.
+const HELP_TEXT_COLUMN: usize = HELP_KEY_WIDTH + 3;
+/// Narrowest text column kept beside the keys; below it, text goes under
+/// its key so that long slash-joined words still fit whole.
+const HELP_TEXT_MIN: usize = 30;
+const HELP_BULLET: &str = "• ";
+
+impl HelpItem {
+    fn section_style() -> Style { Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD) }
+    fn key_style() -> Style { Style::new().fg(TEXT).add_modifier(Modifier::BOLD) }
+
+    /// Help text as spans. `backticked` values the TUI prints take the key
+    /// style, so they stand out from the description, and the color the
+    /// main view gives them under `entry` while colors are on; the
+    /// backticks never reach the screen. `‹keys›` keep their brackets, as
+    /// in the command legends, and take the key style.
+    fn spans(text: &str, style: Style, entry: &str, colors: bool) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (i, part) in text.split('`').enumerate().filter(|(_, part)| !part.is_empty()) {
+            if i % 2 == 1 {
+                spans.push(Span::styled(part.to_string(), Self::value_style(entry, part, colors)));
+                continue;
+            }
+            let mut rest = part;
+            while let Some(open) = rest.find('‹') {
+                let Some(close) = rest[open..].find('›').map(|c| open + c + '›'.len_utf8()) else { break };
+                if open > 0 { spans.push(Span::styled(rest[..open].to_string(), style)); }
+                spans.push(Span::styled(rest[open..close].to_string(), Self::key_style()));
+                rest = &rest[close..];
+            }
+            if !rest.is_empty() { spans.push(Span::styled(rest.to_string(), style)); }
+        }
+        spans
+    }
+
+    fn value_style(entry: &str, value: &str, colors: bool) -> Style {
+        match help_value_color(entry, value).filter(|_| colors) {
+            Some(color) => Self::key_style().fg(color),
+            None => Self::key_style(),
+        }
+    }
+
+    /// The key column: keys and names in the key style, a value in its color.
+    fn key_spans(k: &str, entry: &str, colors: bool) -> Vec<Span<'static>> {
+        Self::spans(k, Self::key_style(), entry, colors)
+    }
+
+    /// The entry on one line, however wide.
+    #[cfg(test)]
+    fn line(self, entry: &str, colors: bool) -> Line<'static> {
+        let pad = |spans: Vec<Span<'static>>| {
+            let used: usize = spans.iter().map(|s| printed_width(&s.content)).sum();
+            [vec![Span::raw("  ")], spans, vec![Span::raw(" ".repeat(HELP_KEY_WIDTH.saturating_sub(used) + 1))]].concat()
+        };
+        match self {
+            HelpItem::Blank => Line::from(""),
+            HelpItem::Section(s) => Line::from(Self::spans(s, Self::section_style(), entry, colors)),
+            HelpItem::Entry(k, v) => Line::from([pad(Self::key_spans(k, entry, colors)), Self::spans(v, Style::new().fg(HELP), entry, colors)].concat()),
+            HelpItem::Item(v) => Line::from([pad(vec![]), vec![Span::styled(HELP_BULLET, Style::new().fg(HELP))], Self::spans(v, Style::new().fg(HELP), entry, colors)].concat()),
+            HelpItem::Note(s) => Line::from([vec![Span::raw("  ")], Self::spans(s, Style::new().fg(FILTER), entry, colors)].concat()),
+        }
+    }
+
+    /// The entry wrapped to `width`. Text continues under its own column; a
+    /// key wider than the key column, or a terminal too narrow for both
+    /// columns, puts the text on the lines below the key. An item hangs
+    /// under its bullet.
+    fn wrapped(self, width: usize, entry: &str, colors: bool) -> Vec<Line<'static>> {
+        let indented = |spans: Vec<Span<'static>>, first: usize, rest: usize| -> Vec<Line<'static>> {
+            help_wrap(spans, width.saturating_sub(rest)).into_iter().enumerate()
+                .map(|(i, mut line)| { line.spans.insert(0, Span::raw(" ".repeat(if i == 0 { first } else { rest }))); line })
+                .collect()
+        };
+        let two_columns = width >= HELP_TEXT_COLUMN + HELP_TEXT_MIN;
+        let column = if two_columns { HELP_TEXT_COLUMN } else { 4 };
+        let text = |v: &str| Self::spans(v, Style::new().fg(HELP), entry, colors);
+        match self {
+            HelpItem::Blank => vec![Line::from("")],
+            HelpItem::Section(s) => indented(Self::spans(s, Self::section_style(), entry, colors), 0, 0),
+            HelpItem::Note(s) => indented(Self::spans(s, Style::new().fg(FILTER), entry, colors), 2, 2),
+            HelpItem::Item(v) => {
+                let bullet = printed_width(HELP_BULLET);
+                let mut lines = indented(text(v), column + bullet, column + bullet);
+                if let Some(first) = lines.first_mut() {
+                    first.spans[0] = Span::raw(" ".repeat(column));
+                    first.spans.insert(1, Span::styled(HELP_BULLET, Style::new().fg(HELP)));
+                }
+                lines
+            }
+            HelpItem::Entry(k, v) => {
+                if k.is_empty() {
+                    return indented(text(v), column, column);
+                }
+                let key = Self::key_spans(k, entry, colors);
+                if !two_columns || printed_width(k) > HELP_KEY_WIDTH {
+                    let mut lines = indented(key, 2, 2);
+                    lines.extend(indented(text(v), column, column));
+                    return lines;
+                }
+                let mut lines = indented(text(v), HELP_TEXT_COLUMN, HELP_TEXT_COLUMN);
+                let used: usize = key.iter().map(|s| printed_width(&s.content)).sum();
+                let mut head = vec![Span::raw("  ")];
+                head.extend(key);
+                head.push(Span::raw(" ".repeat(HELP_KEY_WIDTH - used + 1)));
+                match lines.first_mut() {
+                    Some(first) => drop(first.spans.splice(0..1, head)),
+                    None => lines.push(Line::from(head)),
+                }
+                lines
+            }
+        }
+    }
+}
+
+/// Lay out `spans` as words no wider than `room`. Words break on whitespace
+/// only, so a highlighted value and the punctuation after it stay together;
+/// a word wider than `room` breaks at the edge.
+fn help_wrap(spans: Vec<Span<'static>>, room: usize) -> Vec<Line<'static>> {
+    let room = room.max(1);
+    let mut words: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut word = Vec::new();
+    for span in spans {
+        let mut part = String::new();
+        for ch in span.content.chars() {
+            if ch.is_whitespace() {
+                if !part.is_empty() { word.push(Span::styled(std::mem::take(&mut part), span.style)); }
+                if !word.is_empty() { words.push(std::mem::take(&mut word)); }
+            } else {
+                part.push(ch);
+            }
+        }
+        if !part.is_empty() { word.push(Span::styled(part, span.style)); }
+    }
+    if !word.is_empty() { words.push(word); }
+    let mut lines = Vec::new();
+    let mut line: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for word in words {
+        let len: usize = word.iter().map(|span| printed_width(&span.content)).sum();
+        if used > 0 && used + 1 + len > room {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            used = 0;
+        }
+        if len > room {
+            for piece in word {
+                for ch in piece.content.chars() {
+                    if used == room { lines.push(Line::from(std::mem::take(&mut line))); used = 0; }
+                    line.push(Span::styled(ch.to_string(), piece.style));
+                    used += 1;
+                }
+            }
+            continue;
+        }
+        if used > 0 { line.push(Span::raw(" ")); used += 1; }
+        used += len;
+        line.extend(word);
+    }
+    if !line.is_empty() { lines.push(Line::from(line)); }
+    lines
+}
+
+/// Every help entry on one line each, as a test reads them.
+#[cfg(test)]
+fn help_body() -> Vec<Line<'static>> {
+    help_entries().into_iter().map(|(item, entry)| item.line(entry, true)).collect()
+}
+
+/// One frame of the TUI drawn at `width` × `height`, as plain text with
+/// trailing spaces trimmed: what `manage --render` prints.
+pub(super) fn render_text(m: &mut Model, width: u16, height: u16) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("an in-memory terminal");
+    terminal.draw(|f| draw(f, m)).expect("drawing into memory");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string() + "\n")
+        .collect()
+}
+
+/// The help screen at `width`, as plain text without colors.
+pub(super) fn help_text(width: u16) -> String {
+    help_lines(width, false)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>().trim_end().to_string() + "\n")
+        .collect()
+}
+
+/// The help laid out for a terminal `width` columns wide; `colors` follows
+/// the main view's color-coding toggle.
+fn help_lines(width: u16, colors: bool) -> Vec<Line<'static>> {
+    help_entries().into_iter().flat_map(|(item, entry)| item.wrapped(usize::from(width), entry, colors)).collect()
+}
+
+/// Each item with the entry it describes: a continuation without a key
+/// belongs to the entry above it, and a section starts afresh. Header KPI
+/// sections describe no colored values.
+fn help_entries() -> Vec<(HelpItem, &'static str)> {
+    let (mut section, mut entry) = ("", "");
+    help_items().into_iter().map(|item| {
+        match item {
+            HelpItem::Entry(k, _) if !k.is_empty() => entry = k,
+            HelpItem::Section(s) => { section = s; entry = ""; }
+            // A note speaks for its section, not for the entry above it.
+            HelpItem::Note(_) => return (item, ""),
+            _ => {}
+        }
+        // Header KPIs print their fields uncolored, so the help does too.
+        (item, if section.ends_with("KPIs") { "" } else { entry })
+    }).collect()
+}
+
+/// The main-view color of a value the help quotes under `entry`, so the
+/// help reads like the table; `None` keeps the plain key style. Header
+/// KPI labels are uncolored in the main view and stay so here.
+fn help_value_color(entry: &str, value: &str) -> Option<Color> {
+    match (entry, value) {
+        (_, "green") => Some(SUCCESS),
+        (_, "blue") => Some(PRIMARY),
+        (_, "purple") => Some(ring_color(4)),
+        (_, "yellow") => Some(WARNING),
+        (_, "red") => Some(ERROR),
+        ("Status" | "bound" | "idle", status) if STATUS_KPI_LABELS.iter().any(|(row, ..)| *row == status) => Some(status_color(status)),
+        ("Execution", label) => EXECUTION_STATES.iter().find(|state| execution_label(state) == label).map(|state| execution_color(state)),
+        ("PeerState", state @ ("current" | "lag" | "unmat" | "unknown")) => Some(materialization_state_color(state)),
+        ("Worker", "-1") => worker_color(-1),
+        ("Mode", mode @ ("a" | "m")) => Some(mode_color(mode)),
+        _ => None,
+    }
+}
+
 /// Everything under the pinned title, in one place so a test can read it.
 /// A column or a key that never appears here is undocumented, and the help
-/// is the only surface that says what `Lag` or `re-confirm!` mean.
-fn help_body() -> Vec<Line<'static>> {
-    let sec = |s: &str| {
-        Line::from(Span::styled(
-            s.to_string(),
-            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        ))
-    };
-    let kv = |k: &str, v: &str| {
-        Line::from(vec![
-            Span::styled(
-                format!("  {:<16} ", k),
-                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(v.to_string(), Style::new().fg(HELP)),
-        ])
-    };
-    let note = |s: &str| Line::from(Span::styled(format!("  {s}"), Style::new().fg(FILTER)));
+/// is the only surface that says what `Lag` or `re-confirm!` mean. Each
+/// KPI and column is named once, in the area of the screen that prints it,
+/// with the values it prints listed beneath it.
+fn help_items() -> Vec<HelpItem> {
+    let sec = HelpItem::Section;
+    let kv = HelpItem::Entry;
+    let item = HelpItem::Item;
+    let note = HelpItem::Note;
 
     vec![
-        Line::from(""),
-        sec("Global progress"),
-        kv("Frame windows", "Node samples once/minute; 60m/24h windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
-        kv("Reward estimates", "60m/24h are observation windows; T (theory in expanded mode) assumes10s/frame. Forecasts in heading order; b exposes shared60m/24h/T sub-items under the Reward column and Allocations header Reward KPI. - unavailable, + known subtotal, ~ beforeQ/d marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
-        kv("Local app notice", "No local materialized frame advanced for 60s across staffed earning allocations; any local advance clears it"),
-        kv("Reported app heads", "No peer-reported app frames advanced on the stated subset of tracked shards. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are yellow, or marked ! with colors off. Requires 3+ fresh snapshots over max(60s, 3 polls); missing/unstaffed rows are excluded. Does not prove a network halt"),
-        kv("RPC", "Connected means fresh local status responses; it does not establish peer or shard health"),
-        kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
-        kv("Auto mode", "Pause/resume and mode changes are available in AUTO. Join/leave/confirm/reject require manual mode; Join also needs a free manual worker"),
-        kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and frame/epoch units. filter* means a column filter is active"),
-        kv("n", "Toggle compact / expanded display (default compact): identity, KPIs, action/reason names, units and recovery/seal detail; default actions remain named"),
-        kv("Peer ID", "Compact shows the last 8 characters; expand for the complete identity"),
-        kv("b", "Visibility picker: Tab moves focus between Columns, Top header and every panel header group; Space toggles; a restores the focused group. Interval/reward options nest beneath their KPI. Panel names and identity columns stay visible"),
-        kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. Unobserved means no timestamp; <60s / >60s are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
-        kv("t", "Cycle refresh 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
-        kv("RPC stale", "No status for 2 polling intervals + 30s, or refresh failure; cached data cannot establish stall"),
-        kv("Colors", "Green: current; blue/purple: rank or normal mode; yellow: delay; red: blocked/error"),
-        sec("Worker progress"),
-        kv("KPI separators", "Middle dot separates KPIs; pipe separates fields within a KPI"),
-        kv("Workers", "Running: reported workers; assigned: workers marked allocated; a binding may outlive its live allocation. Auto/manual: individual modes, including idle workers"),
-        kv("bound", "Worker has a filter but no live allocation row; shown with its local execution, excluded from rewards"),
-        kv("Idle", "Worker has no filter; every reported worker remains visible alongside unassigned allocations"),
-        kv("Status", "Counts every allocation-panel row by effective protocol status, including unassigned, bound and idle rows; ignores filters. Active does not prove execution progress"),
-        kv("LocalMat", "Local height; - unknown; 0! warns of no materialized frames with colors off"),
-        kv("Execution", "start: host starting; sync: staging shard data; serve: ready host; close: awaiting closing certificate; handoff: sealed/awaiting successor; wait: allocation activation"),
-        kv("", "blocked: preparation/admission failure; stopped: engine exited; running: older node reports host startup only; - joining without observations; unknown: phase unavailable"),
-        kv("", "Execution is the local phase, not proof of frame progress or quorum. Local progress notices exclude sync, close, handoff and activation waits"),
-        kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
-        kv("Interval [s]", "Node-observed mean seconds per committed app frame. b exposes60m/24h sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. - unavailable or no advances"),
-        kv("PeerHead", "Peer-reported shard head; yellow (or ! with colors off) marks unchanged fresh reports for max(60s, 3 polls). Remote metadata, not the local cursor"),
-        kv("PeerState", "Peer-reported materialization relative to its head; no local worker phase or peer lifecycle inference"),
-        kv("Details", "Selected allocation footer shows reason/blocker, last advance as <60s / >60s, and Local app frames warnings; no ticking timers"),
-
-        kv("", "Selected allocation shows blocker and last advance; PeerHead is peer-reported metadata"),
-        kv("World size", "Node-reported total world state in GB from the shard-info snapshot, not this table subtotal or local disk use. Toggle under b → Top header; - unreported"),
-        kv("Freshness", "stale: node observation already >30s old at receipt; cached: no worker result for >2 polls +30s. Poll delays do not age the received state"),
-        kv("", "Startup restoration is not an advance; cached worker state is not proof of ongoing execution"),
-        sec("Navigation"),
-        kv("b", "Choose display settings: Tab moves focus between visible groups; ↑/↓ selects, Space toggles; Enter/Esc closes"),
-        kv("Columns", "Visibility shared by both panels; Shift+↑/↓ reorders focused table columns with their sub-items; r restores order. Select/Filter pinned; per TUI session"),
-        kv("Compact preset", "In column chooser, c hides Provers/Size/Shards; a restores all columns"),
-        kv("↑ / k", "Move cursor up"),
-        kv("↓ / j", "Move cursor down"),
-        kv("← / →", "Scroll table horizontally by eight columns"),
-        kv("Scroll hints", "Bottom border counts hidden rows ↑/↓ and columns ←/→"),
-        kv(
-            "Tab",
-            "Cycle Allocations, Available Shards and Notifications; Shift+Tab reverses",
-        ),
-        kv("Space", "Toggle selection on cursor row (advances cursor)"),
-        kv("a", "Select all / deselect all rows in current table"),
-        kv("Boundaries", "Top of Allocations and bottom of Notifications remain fixed"),
-        Line::from(""),
-        sec("Notifications"),
-        kv("v", "Cycle minimum severity: warnings/errors (default), errors only, all"),
-        kv("PgUp / PgDn", "When Notifications is focused, ↑/↓ scroll; Home/End jump to first/last line"),
-        kv("", "[ / ] moves upper boundary up/down; { / } moves lower boundary up/down"),
-        sec("Actions — Allocations panel"),
-        note("Operational commands require Ctrl. Leave/Reject/Pause/Mode ask Enter or Esc."),
-        note("Ctrl+C quits; Ctrl+J/M alias Enter; Ctrl+S/Q may be terminal flow control."),
-        kv(
-            "Ctrl+L",
-            "Leave  — request to leave an Active allocation (status 2)",
-        ),
-        kv(
-            "Ctrl+Y",
-            "Confirm — confirm a pending Join/Leave once the window opens",
-        ),
-        kv("Ctrl+R", "Reject  — reject a pending Join/Leave"),
-        kv("Ctrl+P", "Pause   — pause an Active allocation (status 2)"),
-        kv("Ctrl+U", "Resume  — resume a Paused allocation (status 3)"),
-        kv("Ctrl+O", "Toggle manual / auto worker management on cursor row"),
-        note("Multi-select with Space or 'a' to batch Leave/Confirm/Reject/Pause/Resume."),
-        Line::from(""),
-        sec("Actions — Available Shards panel"),
-        kv("Ctrl+G", "Join    — open worker picker for selected shard(s)"),
-        note("At least one free (unassigned) worker must exist to join."),
-        Line::from(""),
-        sec("Worker picker  (opens on Ctrl+G)"),
-        kv("↑ / k, ↓ / j", "Move cursor between free workers"),
-        kv("Space", "Toggle a worker into the manual-management set"),
-        kv("enter", "Join the shard(s); selected workers are set to Manual"),
-        kv("esc", "Cancel the join"),
-        Line::from(""),
-        sec("Sort mode  (press s)"),
-        kv("s", "Enter sort mode"),
-        kv("← / →", "Move highlight to previous / next column"),
-        kv("enter", "Confirm column, then choose sort order"),
-        kv("a", "Ascending order"),
-        kv("d", "Descending order"),
-        kv("esc", "Cancel sort mode"),
-        note("The sorted column's header is underlined, with ↑ or ↓ for the order."),
-        Line::from(""),
-        sec("Filter mode  (press f)"),
-        kv("f", "Enter filter mode"),
-        kv(
-            "← / →",
-            "Move highlight to previous / next filterable column",
-        ),
-        kv("enter", "Open filter editor for highlighted column"),
-        kv("del / backspace", "Clear filter on highlighted column"),
-        kv("x", "Disable all filters in current panel"),
-        kv("esc", "Close filter mode"),
-        note("An active filter marks its column header with *."),
-        Line::from(""),
-        sec("Filter editor  (enter, from filter mode)"),
-        kv("type", "Text columns take a substring; numeric columns take an"),
-        kv("", "expression like \"> 47\", \"< 100\", or a comma list \"1,5,7\""),
-        kv("backspace", "Delete the last character (Ctrl+H does the same)"),
-        kv("← / →", "Select columns: move between the available values"),
-        kv("Space", "Select columns: toggle the value under the cursor"),
-        kv("a", "Select columns: select all / deselect all values"),
-        kv("enter", "Apply the filter"),
-        kv("esc", "Cancel without changing the filter"),
-        Line::from(""),
+        HelpItem::Blank,
+        sec("Top header KPIs"),
+        kv("Peer ID", "This node's identity; compact `Peer: …` shows the last 8 characters, ‹n› expands it"),
+        kv("Strategy", "Allocation scoring strategy the node reports; expanded mode spells out the priorities:"),
+        item("`H → $`: halt-risk shards first, then reward"),
+        item("`H → D`: halt-risk shards first, then data"),
+        item("`?`: not reported by this node"),
+        kv("Seniority", "Committed prover seniority; committee rings rank members by it (see Ring)"),
+        kv("Global", "The received GLOBAL head, its epoch and the next epoch boundary; ‹b› → Top header selects the fields. `-` until a frame is received. Compact / expanded labels:"),
+        item("`f<frame>` / `frame`: the received GLOBAL head"),
+        item("`e<epoch>` / `epoch`: the epoch that frame falls in"),
+        item("`next Nf` / `next boundary`: frames to the next epoch boundary, where activations, departures, renewals and the epoch reconfirm take effect. `~` estimates the time from the measured GLOBAL interval (`60m`, else `24h`); expanded mode adds the `~HH:MM UTC` it falls at. No measurement, no time"),
+        kv("Global interval", "Mean seconds per received GLOBAL frame in the selected `60m`/`24h` windows (compact label `Global [s …]`); see Frame intervals"),
+        kv("World size", "Node-reported total world state in GB from the shard-info snapshot, not this table subtotal or local disk use; compact label `World`, `-` unreported. Toggle under ‹b› → Top header"),
+        kv("RPC", "Local status responses; they do not establish peer or shard health:"),
+        item("`✓` (expanded: `connected`): fresh responses"),
+        item("`retrying`: refreshes are failing; `RPC retrying | status age | failed retries` stays visible even with the RPC KPI hidden"),
+        item("`stale`: no status for 2 polling intervals + 30s; cached data cannot establish a stall"),
+        item("`unknown`: no response yet"),
+        sec("Panel header KPIs"),
+        kv("KPI separators", "Middle dot `·` separates KPIs; pipe `|` separates the lowercase fields within a KPI"),
+        kv("Workers", "This node's workers:"),
+        item("`run` (expanded: `running`): reported workers"),
+        item("`assigned`: workers marked allocated; a binding may outlive its live allocation"),
+        item("`auto` / `manual`: workers in each management mode, idle ones included; compact shows only a nonzero `manual`"),
+        kv("Status", "Allocations rows by effective protocol status, including unassigned, bound and idle rows; ignores filters. Compact shows nonzero counts only. Compact / expanded labels:"),
+        item("`active`, `paused`, `rejected`, `kicked`: rows with that status; `active` does not prove execution progress"),
+        item("`join` / `joining`, `leave` / `leaving`: pending joins and leaves"),
+        item("`activ` / `activating`, `depart` / `departing`: confirmed joins and leaves until the next epoch boundary"),
+        item("`join expired` / `expired joining`, `leave expired` / `expired leaving`: confirm window missed (`expiredJoin`, `expiredLeave`)"),
+        item("`reconfirm`: stale but recoverable epoch (`re-confirm!`)"),
+        item("`bound`, `idle`: worker rows (see the Status column)"),
+        item("`unknown`: a raw allocation status this client cannot classify"),
+        kv("Claimable", "Authenticated claimable QUIL at the cited frame; compact label `[Q]`"),
+        kv("Reward", "Forecast QUIL/day of the displayed staffed rows in the selected `60m`/`24h`/`T` order; compact label `[~Q/d …]`, which omits zero fields. Estimates, not measured earnings; unassigned rows are excluded:"),
+        item("`now`: active + leaving estimates; compact names it only beside other fields"),
+        item("`paused`: paused estimates, available upon resume"),
+        item("`delta` (compact `Δ`): joining minus leaving; activation epochs may differ"),
+        item("`-`: unavailable; `+` after a value: known subtotal with unknown rows"),
+        kv("Snapshot", "GLOBAL frame the panel's GlobalHead values cite, in expanded headers; compact mode cites it in the GlobalHead column header (see Global citation)"),
+        kv("Shown", "Allocations rows that pass the active column filters / all rows; shown only while filters hide rows"),
+        kv("Selected", "Rows marked for a batch action in that panel (‹space›, or ‹a› for all)"),
+        kv("Count", "Available Shards rows that pass the active column filters"),
+        kv("Level", "Notifications shown at or above this severity; ‹v› cycles it"),
+        kv("Line", "Notifications scroll position, shown when lines exceed the panel"),
         sec("Columns"),
-        kv("Select", "[x] marks the row for a batch action (Space, or `a` for all)"),
+        kv("Select", "`[x]` marks the row for a batch action (‹space›, or ‹a› for all)"),
         kv("Filter", "Shard filter, in hex; shortened from the middle when narrow"),
-        kv("Provers", "Live allocations: active, joining, paused and leaving; not peer availability"),
-        kv("Ring", "Committed rank; ~ marks a join forecast with one ring of competing admissions"),
-        kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; <0.1 preserves small nonzero sizes"),
+        kv("Provers", "Live allocations: active, joining, paused and leaving; not peer availability. ProverPhases splits them by phase"),
+        kv("ProverPhases", "The shard's provers by lifecycle phase, as this node reports them at its frame; counts are provers of this shard, not of this node. Hidden by default: ‹b› → Columns, select it, ‹space›. Zero counts are omitted except active, so an empty shard shows `a0`; compact symbol / expanded name:"),
+        item("`a` / `active`: active provers"),
+        item("`j` / `joining`: joins not yet confirmed"),
+        item("`+` / `activating`: join confirmed; it joins its committee at the next epoch boundary"),
+        item("`l` / `leaving`: leaves not yet confirmed"),
+        item("`-` before a count / `departing`: leave confirmed; it keeps serving until the next epoch boundary"),
+        item("`p` / `paused`: paused provers"),
+        item("`-` alone: unavailable from this node (older server or no shard info)"),
+        item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
+        kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
+        kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
         kv("Shards", "Data shards the filter covers"),
+        kv("LocalMat", "Local materialized height:"),
+        item("`-`: unknown"),
+        item("`0!`: no materialized frames, with colors off; colors show a `yellow` `0`"),
         kv("PeerMat", "Peer-reported materialized height; compared with PeerHead"),
-        kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
-        kv("PeerHead", "Peer-reported shard head; remote metadata"),
-        kv("PeerState", "Peer-reported status; lag/unmat warns, with ! shown when colors are off. Footer uses Peer app frames / Peer materialization, comparing PeerMat with PeerHead"),
-        kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
-        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most24h, samples once/minute. Freshness90s; coverage in RPC. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
-        kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact @-Nf / @+Nf offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames; e changes only the compact Global head unit"),
-        kv("", "Independent of LocalMat and peer metadata; absent on older servers"),
-        kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
-        kv(
-            "Reward [~Q/d]",
-            "Forecast QUIL/day to one decimal, in selected60m/24h/T order (T = theoretical10s/frame; expanded: theory). ~ beforeQ/d marks estimates; <0.1 is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income",
-        ),
-        kv("Current", "Staffed active + leaving reward estimates, not measured income"),
-        kv("Paused", "Staffed paused estimates available upon resume"),
-        kv("Unknown", "- fields unavailable; Now sums known rewards with + for unknown rows"),
-        kv("Reward Delta", "Staffed joining minus leaving estimates; activation epochs may differ"),
-        note("Reward totals follow displayed rows; unassigned rows are excluded."),
-        kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
-        kv("Strategy", "H → $: halt-risk first, then reward; H → D: halt-risk first, then data. Expanded mode spells out the priorities"),
-        kv("Compact balance", "[Q]: authenticated claimable funds at the cited frame; [~Q/d]: estimated daily rewards. Expand to show Claimable and Reward labels"),
-        kv("Compact rewards", "Now: current net estimate; Paused: paused; Δ: joining minus leaving. Zero breakdown fields are omitted; unknown values remain visible. These are estimates, not measured earnings"),
-        kv("Allocation reasons", "$ reward; H halt risk; S split; G merge; T retired; E empty; C capacity; O orphan; M manual; D data; ? unavailable history. n expands names and details. Joining and leaving use recorded local intent; current counts never establish history"),
-        kv("Status", "joining, active, paused, leaving, rejected, kicked;"),
-        kv("", "expiredJoin / expiredLeave: confirm window missed;"),
-        kv("", "re-confirm!: the allocation's epoch is stale but recoverable"),
-        kv("Mode", "Worker management — a: automatic, m: manual (toggle with Ctrl+O)"),
+        kv("PeerHead", "Peer-reported shard head; remote metadata, not the local cursor. `yellow` (or `!` with colors off) marks unchanged fresh reports for max(60s, 3 polls)"),
+        kv("GlobalHead", "Committed app head@generation, independent of LocalMat and peer metadata; absent on older servers:"),
+        item("`-`: unavailable"),
+        item("`0@gN`: a known genesis head"),
+        kv("Execution", "Local phase of the allocation's worker, not proof of frame progress or quorum; local progress notices exclude sync, close, handoff and activation waits:"),
+        item("`start`: host starting"),
+        item("`sync`: staging shard data"),
+        item("`serve`: ready host"),
+        item("`close`: awaiting closing certificate"),
+        item("`handoff`: sealed, awaiting successor"),
+        item("`wait`: awaiting allocation activation"),
+        item("`blocked`: preparation/admission failure"),
+        item("`stopped`: engine exited"),
+        item("`running`: an older node reports host startup only"),
+        item("`stale` / `cached`: old observation (see Freshness)"),
+        item("`-`: joining without observations"),
+        item("`unknown`: phase unavailable"),
+        kv("PeerState", "Peer-reported materialization relative to its head; no local worker phase or peer lifecycle inference. `!` marks a warning with colors off:"),
+        item("`current`: materialized to its head"),
+        item("`lag`: behind its head"),
+        item("`unmat`: nothing materialized"),
+        item("`unknown`: no head"),
+        kv("Reward [~Q/d]", "Forecast QUIL/day to one decimal, in selected `60m`/`24h`/`T` order (`T` = theoretical 10s/frame; expanded: `theory`). `~` before `Q/d` marks estimates; `<0.1` is a trickle; current per-frame pricing/ring applied to observed cadence, not historical credited income"),
+        kv("Worker", "Core the allocation is bound to; `-1` means none is bound"),
+        kv("Status", "Effective protocol status of the row:"),
+        item("`joining`, `active`, `paused`, `leaving`, `rejected`, `kicked`: protocol status"),
+        item("`activating`: join confirmed; it joins its committee at the next epoch boundary"),
+        item("`departing`: leave confirmed; it keeps serving until the next epoch boundary"),
+        item("`expiredJoin` / `expiredLeave`: confirm window missed"),
+        item("`re-confirm!`: the allocation's epoch is stale but recoverable"),
+        item("`bound`: a worker bound to a filter with no live allocation row, usually because a closing session it still belongs to keeps it until that session seals or GLOBAL fences it; it is then released for a waiting allocation. Shown with its local execution, excluded from rewards"),
+        item("`idle`: a worker with no filter; every reported worker remains visible alongside unassigned allocations"),
+        item("`unknown`: a raw allocation status this client cannot classify"),
+        item("`joining(…)` / `activating(…)` / `leaving(…)` / `departing(…)`: the recorded local reason, a symbol in compact mode and a name in expanded: `$` reward, `H` halt risk, `S` split, `G` merge, `T` retired, `E` empty, `C` capacity, `O` orphan, `M` manual, `D` data, `?` unavailable history; current counts never establish history"),
+        kv("Mode", "Worker management; ‹Ctrl+O› toggles:"),
+        item("`a`: automatic"),
+        item("`m`: manual"),
         kv("NextAction", "What you can do now, and the threshold it applies from"),
-        kv(
-            "DefaultAction",
-            "What the network does if you do nothing, and when",
-        ),
-        note("Thresholds read f<frame> or e<epoch>; press e to switch. Q/d is whole"),
-        note("QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns,"),
-        note("minus the ones that only exist once a shard is allocated to you."),
-        Line::from(""),
-        sec("General"),
-        kv(
-            "c",
-            "Toggle color-coding of Ring, Mat/Lag/State, Worker, Status and Mode",
-        ),
-        kv(
-            "e",
-            "Show Next/Default Action thresholds as frames (f…) or epochs (e…)",
-        ),
-        kv("h", "Open this help screen (↑/↓ or PgUp/PgDn scroll; h or esc closes)"),
-        kv("q / Ctrl+C", "Quit"),
-        Line::from(""),
+        kv("DefaultAction", "What the network does if you do nothing, and when"),
+        kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
+        note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
+        sec("Footers and notifications"),
+        kv("Details", "Selected allocation footer shows reason/blocker, last advance as `<60s` / `>60s`, and Local app frames warnings; no ticking timers. PeerHead is peer-reported metadata"),
+        kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
+        kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
+        item("`stale`: node observation already >30s old at receipt"),
+        item("`cached`: no worker result for >2 polls +30s; not proof of ongoing execution"),
+        kv("Local app notice", "No local materialized frame advanced for 60s across staffed earning allocations; any local advance clears it"),
+        kv("Reported app heads", "No peer-reported app frames advanced on the stated subset of tracked shards. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Requires 3+ fresh snapshots over max(60s, 3 polls); missing/unstaffed rows are excluded. Does not prove a network halt"),
+        kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
+        kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
+        kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
+        kv("Colors", "What the main view's colors mean:"),
+        item("`green`: current"),
+        item("`blue` / `purple`: rank or normal mode"),
+        item("`yellow`: delay"),
+        item("`red`: blocked/error"),
+        sec("Measurements and forecasts"),
+        kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
+        kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute. Freshness 90s; coverage in RPC. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
+        kv("Reward estimates", "`60m`/`24h` are observation windows; `T` (`theory` in expanded mode) assumes 10s/frame. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
+        kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames"),
+        sec("Display"),
+        kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
+        kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval, reward and Global field options nest beneath their KPI. Panel names and identity columns stay visible"),
+        kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; settings last for the TUI session"),
+        kv("‹t›", "Cycle refresh (t: timer) 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
+        kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
+        kv("‹e›", "Show Next/Default Action thresholds relative to the received GLOBAL frame (`in Nf`, default) or as absolute frames (`@f…`)"),
+        kv("‹h›", "Open this help (‹↑/↓› or ‹Pg↑/↓› scroll; ‹h› or ‹esc› closes)"),
+        kv("‹q› / ‹Ctrl+C›", "Quit"),
+        sec("Navigation"),
+        kv("‹↑/k›", "Move cursor up; scrolls Notifications when it is focused"),
+        kv("‹↓/j›", "Move cursor down; scrolls Notifications when it is focused"),
+        kv("‹←/→›", "Scroll table horizontally by eight columns"),
+        kv("‹tab›", "Cycle Allocations, Available Shards and Notifications; ‹Shift+tab› reverses"),
+        kv("‹space›", "Toggle selection on cursor row (advances cursor)"),
+        kv("‹a›", "Select all / deselect all rows in current table"),
+        kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
+        kv("Boundaries", "Top of Allocations and bottom of Notifications remain fixed"),
+        sec("Notifications"),
+        kv("‹v›", "Cycle minimum severity (v: verbosity): warnings/errors (default), errors only, all"),
+        kv("‹Pg↑/↓›", "Page through Notifications; ‹Home/End› jump to its first/last line"),
+        kv("‹[/]› / ‹{/}›", "Move the upper boundary up/down / the lower boundary up/down"),
+        sec("Actions — Allocations panel"),
+        note("Operational commands require Ctrl. Leave/Reject/Pause/Mode ask ‹enter› or ‹esc›."),
+        note("‹Ctrl+C› quits; ‹Ctrl+J›/‹Ctrl+M› alias ‹enter›; ‹Ctrl+S›/‹Ctrl+Q› may be terminal flow control. Terminals also send ‹Ctrl+I› as ‹tab› and ‹Ctrl+H› as backspace, which is why some actions take a less obvious letter."),
+        note("Pause/resume and mode changes are available in `AUTO`. Join/leave/confirm/reject require manual mode; Join also needs a free manual worker."),
+        kv("‹Ctrl+L›", "Leave — request to leave an Active allocation (status 2)"),
+        kv("‹Ctrl+Y›", "Confirm (Y: yes) — confirm a pending Join/Leave once the window opens"),
+        kv("‹Ctrl+R›", "Reject — reject a pending Join/Leave"),
+        kv("‹Ctrl+P›", "Pause — pause an Active allocation (status 2)"),
+        kv("‹Ctrl+U›", "Resume (U: unpause) — resume a Paused allocation (status 3)"),
+        kv("‹Ctrl+O›", "Mode (O: own) — toggle manual / auto worker management on cursor row"),
+        note("Multi-select with ‹space› or ‹a› to batch Leave/Confirm/Reject/Pause/Resume."),
+        HelpItem::Blank,
+        sec("Actions — Available Shards panel"),
+        kv("‹Ctrl+G›", "Join (G: go) — open worker picker for selected shard(s)"),
+        note("At least one free (unassigned) worker must exist to join."),
+        HelpItem::Blank,
+        sec("Worker picker  (opens on ‹Ctrl+G›)"),
+        kv("‹↑/k› / ‹↓/j›", "Move cursor between free workers"),
+        kv("‹space›", "Toggle a worker into the manual-management set"),
+        kv("‹enter›", "Join the shard(s); selected workers are set to Manual"),
+        kv("‹esc›", "Cancel the join"),
+        HelpItem::Blank,
+        sec("Sort mode  (press ‹s›)"),
+        kv("‹s›", "Enter sort mode"),
+        kv("‹←/→›", "Move highlight to previous / next column"),
+        kv("‹enter›", "Confirm column, then choose sort order"),
+        kv("‹a›", "Ascending order"),
+        kv("‹d›", "Descending order"),
+        kv("‹esc›", "Cancel sort mode"),
+        note("The sorted column's header is underlined, with `↑` or `↓` for the order."),
+        HelpItem::Blank,
+        sec("Filter mode  (press ‹f›)"),
+        kv("‹f›", "Enter filter mode"),
+        kv("‹←/→›", "Move highlight to previous / next filterable column"),
+        kv("‹enter›", "Open filter editor for highlighted column"),
+        kv("‹del› / ‹backspace›", "Clear filter on highlighted column"),
+        kv("‹x›", "Disable all filters in current panel (x: clear)"),
+        kv("‹esc›", "Close filter mode"),
+        note("An active filter marks its column header with `*`."),
+        HelpItem::Blank,
+        sec("Filter editor  (‹enter›, from filter mode)"),
+        kv("Typing", "Text columns take a substring; numeric columns take an expression like `> 47`, `< 100`, or a comma list `1,5,7`"),
+        kv("‹backspace›", "Delete the last character (‹Ctrl+H› does the same)"),
+        kv("‹←/→›", "Select columns: move between the available values"),
+        kv("‹space›", "Select columns: toggle the value under the cursor"),
+        kv("‹a›", "Select columns: select all / deselect all values"),
+        kv("‹enter›", "Apply the filter"),
+        kv("‹esc›", "Cancel without changing the filter"),
+        HelpItem::Blank,
     ]
 }
 
@@ -2181,7 +2531,8 @@ fn render_visibility_group(f: &mut Frame, m: &mut Model, section: usize, title: 
     for (index, name) in names.iter().enumerate().skip(offset).take(visible) {
         let selected = active && index == m.column_picker_cursor;
         let required = section == 0 && index < 2;
-        let child = m.visibility_interval_window(section, index).is_some() || m.visibility_reward_window(section, index).is_some();
+        let child = m.visibility_interval_window(section, index).is_some() || m.visibility_reward_window(section, index).is_some()
+            || m.visibility_global_field(section, index).is_some();
         let indent = if child { "  " } else { "" };
         let label = format!("{}{}", name.trim_start(), if required { " (required)" } else { "" });
         let text = format!("{} {}{} {}", if selected { "▶" } else { " " },
@@ -2310,6 +2661,35 @@ mod tests {
         assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]: 1 @f123456"));
     }
 
+    /// A render is the drawn frame as text: one line per row, no trailing
+    /// spaces, with the same content an interactive draw shows.
+    #[test]
+    fn a_render_prints_the_drawn_frame_as_text() {
+        let mut m = Model::new(); m.compact_actions = false; m.data_loaded = true;
+        m.allocations = joining_table();
+        let text = render_text(&mut m, 100, 40);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 40);
+        assert!(lines.iter().all(|l| !l.ends_with(' ')));
+        assert!(lines.iter().any(|l| l.contains("Select Filter")), "{text}");
+        assert!(!text.contains('\u{1b}'), "no escape sequences");
+    }
+
+    /// The help as text keeps every section heading and has no styling.
+    #[test]
+    fn help_text_lists_the_help_sections() {
+        let text = super::help_text(100);
+        // Wrapping folds a heading's runs of spaces into one.
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words = flat(&text);
+        for item in help_items() {
+            if let HelpItem::Section(section) = item {
+                assert!(words.contains(&flat(section)), "missing section {section}");
+            }
+        }
+        assert!(!text.contains('\u{1b}'));
+    }
+
     #[test]
     fn wrapped_allocation_heading_stays_visible_when_table_pans() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -2324,7 +2704,7 @@ mod tests {
         };
         let before = render(&mut terminal, &mut m);
         let table = before.iter().position(|l| l.contains("Select Filter")).unwrap();
-        assert!(before[..table].iter().any(|l| l.contains("Reward [~Q/d 60m/24h/theory]: Now")));
+        assert!(before[..table].iter().any(|l| l.contains("Reward [~Q/d 60m/24h/theory]: now")));
         m.horizontal_offsets[0] = 30;
         let after = render(&mut terminal, &mut m);
         assert_eq!(&before[..table], &after[..table]);
@@ -2378,7 +2758,7 @@ mod tests {
         let mut m = Model::new(); m.compact_actions = false; m.compact_units = false;
         let title = alloc_title(&m, &[]).to_string();
         assert!(title.contains(" · Status:") && title.contains(" · Claimable"));
-        assert!(title.contains(" · Reward [~Q/d 60m/24h/theory]:") && title.contains("| Paused"));
+        assert!(title.contains(" · Reward [~Q/d 60m/24h/theory]:") && title.contains("| paused"));
         assert!(title.contains(" · Snapshot:"));
         assert!(!title.contains("  "));
         assert!(avail_title(&m, &[]).to_string().contains(" · Snapshot:"));
@@ -2388,7 +2768,7 @@ mod tests {
     fn worker_counts_belong_to_allocations_and_not_the_top_header() {
         let mut m = Model::new(); m.compact_actions = false; m.data_loaded = true; m.running_workers = 15;
         assert!(!header_line(&m).to_string().contains("Workers:"));
-        assert!(alloc_title(&m, &[]).to_string().contains("Workers: Running 15"));
+        assert!(alloc_title(&m, &[]).to_string().contains("Workers: running 15"));
         m.data_loaded = false;
         assert_eq!(header_lines(&m, 40).len(), 1);
     }
@@ -2539,7 +2919,7 @@ mod tests {
         for ring in [0, 1, 2, 3, 4, 100, UNKNOWN_REWARD_RING] {
             assert_ne!(ring_color(ring), ERROR);
         }
-        for status in ["active", "joining", "leaving", "paused", "re-confirm!"] {
+        for status in ["active", "joining", "activating", "leaving", "departing", "paused", "re-confirm!"] {
             assert_ne!(status_color(status), ERROR);
         }
         assert_ne!(mode_color("m"), ERROR);
@@ -2734,11 +3114,11 @@ mod tests {
         known.status = 2; known.epoch = 3; known.estimated_reward = BigInt::from(10000);
         let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
         let title = alloc_title(&m, &[known.clone(), unknown.clone()]).to_string();
-        assert!(title.contains(&format!("Now -/-/{}+ |", fmt_reward(&known.estimated_reward))), "{title}");
-        assert!(alloc_title(&m, &[unknown]).to_string().contains("Now -/-/- |"));
+        assert!(title.contains(&format!("now -/-/{}+ |", fmt_reward(&known.estimated_reward))), "{title}");
+        assert!(alloc_title(&m, &[unknown]).to_string().contains("now -/-/- |"));
         known.estimated_reward = BigInt::from(0);
         let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
-        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Now -/-/0.0+ |"));
+        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("now -/-/0.0+ |"));
     }
 
     #[test]
@@ -3165,6 +3545,7 @@ mod tests {
             status_name: "joining".to_string(),
             ring: 5,
             active_provers: provers,
+            prover_counts: None,
             shard_size: BigInt::from(0),
             data_shards: shards,
             materialized_frame: 0,
@@ -3291,7 +3672,7 @@ mod tests {
         ended.leave_confirm_frame = 1400;
         let title = alloc_title(&m, &[active, joining, unstaffed, expired, paused, leaving, unstaffed_leave, ended]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains(&format!("Now -/-/{} | Paused -/-/{} | Delta -/-/-{}",
+        assert!(text.contains(&format!("now -/-/{} | paused -/-/{} | delta -/-/-{}",
             fmt_reward(&BigInt::from(60000)), fmt_reward(&BigInt::from(40000)),
             fmt_reward(&BigInt::from(30000)))), "{text}");
     }
@@ -3328,6 +3709,7 @@ mod tests {
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),
             active_provers: 42,
+            prover_counts: None,
             ring: 1,
             shard_size: BigInt::from(size),
             data_shards: 2,
@@ -3396,8 +3778,8 @@ mod tests {
         for mode in [ColumnSizing::Fixed, ColumnSizing::Dynamic] {
             m.column_sizing = mode;
             let (alloc, avail) = shared_col_widths(&m, 260, &[a.clone()], &[peer.clone()]);
-            assert_eq!(alloc.len(), 17);
-            assert_eq!(avail.len(), 12);
+            assert_eq!(alloc.len(), 18);
+            assert_eq!(avail.len(), 13);
             assert_eq!(alloc[16], avail[11]);
             assert!(alloc[16] >= "15.0".len());
         }
@@ -3449,9 +3831,9 @@ mod tests {
         let mut orphan = active.clone(); orphan.worker_id = -1;
         m.allocations = vec![active, joining, orphan];
         assert_eq!(m.frame_number, 0, "no shard-info snapshot yet");
-        assert!(allocation_status_kpi(&m).contains("Active 2"));
+        assert!(allocation_status_kpi(&m).contains("active 2"));
         m.frame_number = 720;
-        assert!(allocation_status_kpi(&m).contains("Active 2"), "cached shard frame does not classify current workers");
+        assert!(allocation_status_kpi(&m).contains("active 2"), "cached shard frame does not classify current workers");
     }
 
     #[test]
@@ -3475,12 +3857,13 @@ mod tests {
         assert!(detail.contains("Worker bound; no live allocation reported."));
         assert!(detail.contains("Blocker: closing session"));
         let title = alloc_title(&m, &m.allocations).to_string();
-        assert!(title.contains("Status: Bound 1"));
+        assert!(title.contains("Status: bound 1"));
         assert!(!title.contains("86.4"), "worker-only estimates do not enter reward totals");
         bound.execution = None;
         assert!(allocation_detail(&m, &bound).to_string().contains("no live allocation reported"));
         let help = help_body().iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
-        assert!(help.contains("Running: reported workers; assigned: workers marked allocated"));
+        assert!(help.contains("run (expanded: running): reported workers"));
+        assert!(help.contains("assigned: workers marked allocated"));
         assert!(help.contains("a binding may outlive its live allocation"));
         assert!(help.contains("excluded from rewards"));
     }
@@ -3499,16 +3882,16 @@ mod tests {
             WorkerInfo { core_id: 9, ..Default::default() },
             WorkerInfo { core_id: 7, ..Default::default() },
         ] });
-        assert_eq!(worker_counts_line(&m).to_string(), "Workers: Running 3 | Assigned 2 | Auto 2 | Manual 1");
-        assert!(alloc_title(&m, &m.allocations).to_string().contains("Status: Active 3 | Paused 1"));
+        assert_eq!(worker_counts_line(&m).to_string(), "Workers: running 3 | assigned 2 | auto 2 | manual 1");
+        assert!(alloc_title(&m, &m.allocations).to_string().contains("Status: active 3 | paused 1"));
         m.alloc_col_filters.insert(1, ColumnFilter { text: "no matching allocation".into(), ..Default::default() });
         assert!(m.filtered_allocations().is_empty());
-        assert!(worker_counts_line(&m).to_string().contains("Auto 2 | Manual 1"));
-        assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Status: Active 3 | Paused 1"));
+        assert!(worker_counts_line(&m).to_string().contains("auto 2 | manual 1"));
+        assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Status: active 3 | paused 1"));
         assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Shown 0/4"));
         m.cached_worker_info = None;
-        assert!(worker_counts_line(&m).to_string().contains("Auto ? | Manual ?"));
-        assert!(alloc_title(&m, &[]).to_string().contains("Status: Active 3 | Paused 1"));
+        assert!(worker_counts_line(&m).to_string().contains("auto ? | manual ?"));
+        assert!(alloc_title(&m, &[]).to_string().contains("Status: active 3 | paused 1"));
     }
 
     /// Nodes report lifecycle phases; older nodes report `running`. Both
@@ -3632,6 +4015,7 @@ mod tests {
                 13, // "(pause|leave)", wider than "NextAction"
                 16, // "activate@f699840", wider than "DefaultAction"
                 20, // "Interval [s 60m/24h]"
+                0,  // "ProverPhases", hidden by default
             ]
         );
         assert_eq!(fw, 15);
@@ -3642,7 +4026,7 @@ mod tests {
     #[test]
     fn fixed_sizing_reserves_the_local_and_peer_column_labels() {
         let (w, fw) = alloc_col_widths(&fixed(), 165, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20]);
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20, 0]);
         assert_eq!(fw, 12);
         assert_eq!(w.iter().sum::<usize>() + 16, 216);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
@@ -3657,7 +4041,8 @@ mod tests {
         for m in [Model::new(), fixed(), expanded] {
             let rows = joining_table();
             let (w, fw) = alloc_col_widths(&m, 165, &rows);
-            for (c, width) in w.iter().enumerate() {
+            // A hidden column takes no width and prints no cell.
+            for (c, width) in w.iter().enumerate().filter(|(c, _)| m.alloc_column_visible(*c)) {
                 for a in &rows {
                     let cell = alloc_cell(&m, a, c, fw);
                     assert!(
@@ -3789,6 +4174,87 @@ mod tests {
         assert_eq!(worker_color(57), None);
     }
 
+    #[test]
+    fn prover_phase_cells_omit_zero_fields_except_active_in_both_modes() {
+        use quil_types::proto::node::ShardProverCounts;
+        let mut m = Model::new();
+        let sample = ShardProverCounts { joining: 3, activating: 1, active: 12, paused: 0, leaving: 2, departing: 1 };
+        let mut a = row("aa", 19, 1, 1, "", "");
+        a.shard_size = BigInt::from(1_000_000u64);
+        a.prover_counts = Some(sample.clone());
+        let mut s = shard("bb", 1_000_000, 0);
+        s.prover_counts = Some(sample);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "a12 j3 +1 l2 -1");
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "a12 j3 +1 l2 -1");
+        m.compact_actions = false;
+        let expanded = "12 active, 3 joining, 1 activating, 2 leaving, 1 departing";
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), expanded);
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), expanded);
+        a.prover_counts = Some(ShardProverCounts { active: 5, paused: 2, ..Default::default() });
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "5 active, 2 paused");
+        m.compact_actions = true;
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "a5 p2");
+        // An empty shard keeps its active field; without data it is no halt risk.
+        s.shard_size = BigInt::from(0);
+        s.prover_counts = Some(ShardProverCounts::default());
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "a0");
+        m.compact_actions = false;
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "0 active");
+        // Unreported counts are unavailable, not zero.
+        a.prover_counts = None;
+        s.prover_counts = None;
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "-");
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "-");
+    }
+
+    #[test]
+    fn prover_phases_warn_of_halt_risk_by_active_and_activating_count() {
+        use quil_types::proto::node::ShardProverCounts;
+        let counts = |active, activating, joining| Some(ShardProverCounts { active, activating, joining, ..Default::default() });
+        let size = BigInt::from(1u64);
+        assert!(prover_halt_risk(counts(2, 1, 9).as_ref(), &size), "unconfirmed joins are no coverage");
+        assert!(prover_halt_risk(counts(0, 0, 0).as_ref(), &size));
+        assert!(!prover_halt_risk(counts(3, 1, 0).as_ref(), &size), "a confirmed join is coverage");
+        assert!(!prover_halt_risk(counts(4, 0, 0).as_ref(), &size));
+        assert!(!prover_halt_risk(counts(0, 0, 0).as_ref(), &BigInt::from(0)), "a shard without data cannot halt");
+        assert!(!prover_halt_risk(None, &size), "unreported counts establish nothing");
+
+        let mut m = Model::new();
+        m.hidden_columns.remove(&ALLOC_PROVER_PHASES_COL);
+        let mut risky = row("aa", 3, 1, 1, "", "");
+        risky.shard_size = size.clone();
+        risky.prover_counts = counts(2, 1, 0);
+        let mut healthy = row("bb", 4, 1, 2, "", "");
+        healthy.shard_size = size.clone();
+        healthy.prover_counts = counts(4, 0, 0);
+        let mut risky_shard = shard("cc", 1, 0);
+        risky_shard.prover_counts = risky.prover_counts.clone();
+        let mut healthy_shard = shard("dd", 1, 0);
+        healthy_shard.prover_counts = healthy.prover_counts.clone();
+        // Colors off: `!` marks the warning; colors on keep its slot blank.
+        m.color_coding = false;
+        assert_eq!(alloc_display_cell(&m, &risky, ALLOC_PROVER_PHASES_COL, 0), "a2 +1!");
+        assert_eq!(alloc_display_cell(&m, &healthy, ALLOC_PROVER_PHASES_COL, 0), "a4 ");
+        assert_eq!(avail_display_cell(&m, &risky_shard, AVAIL_PROVER_PHASES_COL, 0), "a2 +1!");
+        m.color_coding = true;
+        assert_eq!(alloc_display_cell(&m, &risky, ALLOC_PROVER_PHASES_COL, 0), "a2 +1 ");
+        let fg = |lines: &[Line<'static>], line: usize, text: &str| lines[line].spans.iter()
+            .find(|span| span.content.trim() == text).unwrap_or_else(|| panic!("no `{text}` cell: {}", lines[line])).style.fg;
+        // Both row renderings: the cursor row and the others.
+        for allocations in [[risky.clone(), healthy.clone()], [healthy.clone(), risky.clone()]] {
+            let lines = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 300, 6), None);
+            let (r, h) = if allocations[0].filter_hex == "aa" { (1, 2) } else { (2, 1) };
+            assert_eq!(fg(&lines, r, "a2 +1"), Some(WARNING));
+            assert_ne!(fg(&lines, h, "a4"), Some(WARNING));
+        }
+        for available in [[risky_shard.clone(), healthy_shard.clone()], [healthy_shard.clone(), risky_shard.clone()]] {
+            let lines = render_avail_panel(&mut m, &available, Rect::new(0, 0, 300, 6), None);
+            let (r, h) = if available[0].filter_hex == "cc" { (1, 2) } else { (2, 1) };
+            assert_eq!(fg(&lines, r, "a2 +1"), Some(WARNING));
+            assert_ne!(fg(&lines, h, "a4"), Some(WARNING));
+        }
+    }
+
     fn help_text() -> String {
         help_body()
             .iter()
@@ -3807,9 +4273,75 @@ mod tests {
     /// undocumented, and nothing else would catch it.
     #[test]
     fn every_column_has_a_help_entry() {
-        let text = help_text();
+        let sections = help_sections();
         for name in ALLOC_COL_NAMES.iter().chain(AVAIL_COL_NAMES.iter()) {
-            assert!(text.contains(*name), "column `{name}` has no help entry");
+            let count = sections.iter().filter(|(section, key, _)| *section == "Columns" && key == name).count();
+            assert_eq!(count, 1, "column `{name}` needs exactly one entry under Columns");
+        }
+    }
+
+    /// Each entry with the section it sits in, its key and the values its
+    /// items list, so a test can ask where a name and its values appear.
+    fn help_sections() -> Vec<(&'static str, String, Vec<String>)> {
+        let mut section = "";
+        let mut entries: Vec<(&'static str, String, Vec<String>)> = Vec::new();
+        for item in help_items() {
+            match item {
+                HelpItem::Section(s) => section = s,
+                HelpItem::Entry(k, _) if !k.is_empty() => entries.push((section, k.to_string(), vec![])),
+                HelpItem::Item(text) => {
+                    let values = text.split('`').skip(1).step_by(2).map(str::to_string);
+                    entries.last_mut().expect("an item follows its entry").2.extend(values);
+                }
+                _ => {}
+            }
+        }
+        entries
+    }
+
+    /// A value is documented under the KPI or column that prints it, never
+    /// as an entry of its own: the key column holds keys, KPI and column
+    /// names, and a fixed set of topics.
+    #[test]
+    fn every_value_is_listed_under_the_name_that_prints_it() {
+        let sections = help_sections();
+        let values = |section: &str, key: &str| sections.iter().find(|(s, k, _)| *s == section && k == key)
+            .unwrap_or_else(|| panic!("no `{key}` entry under {section}")).2.clone();
+        let column = values("Columns", "Status");
+        for (row, ..) in STATUS_KPI_LABELS {
+            assert!(column.iter().any(|v| v == row), "status `{row}` is not listed under the Status column");
+        }
+        let kpi = values("Panel header KPIs", "Status");
+        for (_, compact, expanded) in STATUS_KPI_LABELS {
+            for label in [compact, expanded] {
+                assert!(kpi.iter().any(|v| v == label), "Status KPI label `{label}` is not listed under the Status KPI");
+            }
+        }
+        let execution = values("Columns", "Execution");
+        for state in EXECUTION_STATES {
+            let label = execution_label(state);
+            assert!(execution.iter().any(|v| v.split(" / ").any(|v| v == label) || v == label), "execution `{label}` is not listed under Execution");
+        }
+        let peer = values("Columns", "PeerState");
+        for state in ["current", "lag", "unmat", "unknown"] {
+            assert!(peer.iter().any(|v| v == state), "peer state `{state}` is not listed under PeerState");
+        }
+        for value in ["a", "m"] {
+            assert!(values("Columns", "Mode").iter().any(|v| v == value), "mode `{value}` is not listed under Mode");
+        }
+        let global = values("Top header KPIs", "Global");
+        for label in GLOBAL_FIELD_NAMES.iter().map(|name| name.trim()).chain(["f<frame>", "e<epoch>", "next Nf"]) {
+            assert!(global.iter().any(|v| v == label), "Global field `{label}` is not listed under the Global KPI");
+        }
+        let kpis = ["Peer ID", "Strategy", "Seniority", "Global", "Global interval", "World size", "RPC", "Workers", "Status",
+            "Claimable", "Reward", "Snapshot", "Shown", "Selected", "Count", "Level", "Line"];
+        let topics = ["KPI separators", "Details", "Recovery footer", "Freshness", "Local app notice", "Reported app heads",
+            "Global notice", "Command legends", "Scroll hints", "Colors", "Frame windows", "Frame intervals", "Reward estimates",
+            "Global citation", "Columns group", "Cursor", "Boundaries", "Typing"];
+        for (section, key, _) in &sections {
+            let named = key.starts_with('‹') || kpis.contains(&key.as_str()) || topics.contains(&key.as_str())
+                || ALLOC_COL_NAMES.contains(&key.as_str()) || AVAIL_COL_NAMES.contains(&key.as_str());
+            assert!(named, "`{key}` under {section} is neither a key, a KPI, a column nor a known topic");
         }
     }
 
@@ -3818,10 +4350,13 @@ mod tests {
     /// a sentence, which is how `d` and `x` went undocumented while a naive
     /// `contains` said otherwise.
     fn documented_keys() -> Vec<String> {
-        help_body()
-            .iter()
-            .filter(|l| l.spans.len() == 2)
-            .map(|l| l.spans[0].content.trim().to_string())
+        help_items()
+            .into_iter()
+            .filter_map(|item| match item { HelpItem::Entry(key, _) => Some(key), _ => None })
+            .flat_map(|key| {
+                let keys: Vec<String> = key.split('‹').skip(1).filter_map(|k| k.split_once('›')).map(|(k, _)| k.to_string()).collect();
+                if keys.is_empty() { vec![key.trim().to_string()] } else { keys }
+            })
             .collect()
     }
 
@@ -3833,12 +4368,91 @@ mod tests {
         let keys = documented_keys();
         for key in [
             "Ctrl+L", "Ctrl+Y", "Ctrl+R", "Ctrl+P", "Ctrl+U", "Ctrl+O", "Ctrl+G", "s", "f", "c", "e", "h", "a", "x", "d",
-            "Tab", "Space", "enter", "esc", "q / Ctrl+C", "t", "b",
+            "tab", "space", "enter", "esc", "q", "Ctrl+C", "t", "b", "n", "v", "↑/k", "↓/j", "←/→", "[/]", "{/}", "Pg↑/↓",
         ] {
             assert!(
                 keys.iter().any(|k| k == key),
                 "key `{key}` has no help entry"
             );
+        }
+    }
+
+    /// Header KPIs print labels of their own (`Shown 3/9`, `Level: …`,
+    /// `Status: join 1`); each needs an entry, not just its picker name.
+    #[test]
+    fn every_header_kpi_value_has_a_help_entry() {
+        let keys = documented_keys();
+        for key in ["Peer ID", "Strategy", "Seniority", "Global", "Global interval", "World size", "RPC", "Workers", "Status",
+            "Claimable", "Reward", "Shown", "Selected", "Count", "Snapshot", "Level", "Line"] {
+            assert!(keys.iter().any(|k| k == key), "KPI `{key}` has no help entry");
+        }
+        let text = help_text();
+        for (_, compact, expanded) in STATUS_KPI_LABELS {
+            for label in [compact, expanded] {
+                assert!(text.contains(label), "Status label `{label}` has no help description");
+            }
+        }
+    }
+
+    /// Every word of the help must reach a narrow terminal: lines wrap under
+    /// their own column instead of running past the right edge.
+    #[test]
+    fn help_wraps_to_narrow_terminals_without_losing_text() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let words = |text: &str| text.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let expected = words(&help_text());
+        for width in [40u16, 60, 80, 120] {
+            let mut m = Model::new(); m.show_help = true;
+            // Tall enough for the whole help; ratatui caps an area at u16::MAX cells.
+            let mut terminal = Terminal::new(TestBackend::new(width, u16::MAX / width)).unwrap();
+            terminal.draw(|f| draw(f, &mut m)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let screen = (1..1 + m.help_visible as u16)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>().join("\n");
+            assert_eq!(words(&screen), expected, "help text lost at width {width}");
+            assert!(!screen.contains('`'), "value markers reached the screen at width {width}");
+        }
+    }
+
+    /// Values the TUI prints stand out from their description, with or
+    /// without colors.
+    #[test]
+    fn help_values_take_the_key_style() {
+        let line = HelpItem::Entry("LocalMat", "Local height; `-` unknown; `0!` warns").line("LocalMat", true);
+        let styled: Vec<_> = line.spans.iter().map(|span| (span.content.as_ref(), span.style)).collect();
+        assert_eq!(styled[1], ("LocalMat", HelpItem::key_style()));
+        assert_eq!(styled[4], ("-", HelpItem::key_style()));
+        assert_eq!(styled[6], ("0!", HelpItem::key_style()));
+        assert_eq!(styled[5], (" unknown; ", Style::new().fg(HELP)));
+        let keys = HelpItem::Entry("‹b›", "‹space› toggles").line("‹b›", true);
+        let styled: Vec<_> = keys.spans.iter().map(|span| (span.content.as_ref(), span.style)).collect();
+        assert_eq!(styled[1], ("‹b›", HelpItem::key_style()), "keys keep their legend brackets");
+        assert_eq!(styled[3], ("‹space›", HelpItem::key_style()));
+        assert_eq!(styled[4], (" toggles", Style::new().fg(HELP)));
+        assert!(HelpItem::key_style().add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// A value the help quotes takes the color the main view gives it, and
+    /// only while colors are on; header labels and keys stay plain.
+    #[test]
+    fn help_values_keep_their_main_view_colors() {
+        let spans = |colors: bool| help_entries().into_iter()
+            .flat_map(|(item, entry)| item.line(entry, colors).spans.into_iter()
+                .map(move |span| (entry, span.content.trim().to_string(), span.style.fg)))
+            .collect::<Vec<_>>();
+        let cases = [("Status", "re-confirm!", status_color("re-confirm!")), ("", "active", TEXT),
+            ("Status", "bound", WARNING), ("Execution", "serve", SUCCESS), ("Execution", "blocked", ERROR),
+            ("Execution", "sync", HELP), ("PeerState", "lag", WARNING), ("Worker", "-1", ERROR),
+            ("Mode", "m", PRIMARY), ("Mode", "‹Ctrl+O›", TEXT), ("Colors", "green", SUCCESS), ("Colors", "red", ERROR),
+            ("‹b›", "‹a›", TEXT)];
+        for colors in [true, false] {
+            let spans = spans(colors);
+            for (entry, value, color) in cases {
+                let found = spans.iter().find(|(e, v, _)| *e == entry && v == value)
+                    .unwrap_or_else(|| panic!("`{value}` is not quoted under {entry}"));
+                assert_eq!(found.2, Some(if colors { color } else { TEXT }), "`{value}` under {entry}, colors {colors}");
+            }
         }
     }
 
@@ -3917,10 +4531,14 @@ mod tests {
         m.allocations = joining_table();
         m.allocations[0].next_action = ActionHint::at("(reject|confirm)", 2_160);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@e3");
+        m.last_received_frame = 1_500;
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm) in 660f");
+        assert!(help_line(&m).to_string().contains("thresholds relative"));
         assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
         assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@f2160");
+        assert!(help_line(&m).to_string().contains("thresholds absolute"));
+        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm) in 660f");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         assert!(handle_key(&mut m, key(KeyCode::Char('h'))).is_empty());
@@ -4008,16 +4626,16 @@ mod compact_action_tests {
     #[test]
     fn compact_global_units_and_frame_offsets_keep_distinct_citations() {
         let mut m = Model::new(); m.data_loaded = true; m.last_received_frame = 1442; m.epoch_length = 720;
-        assert!(header_line(&m).to_string().contains("Global: f1442"));
-        m.threshold_unit = ThresholdUnit::Epochs;
-        assert!(header_line(&m).to_string().contains("Global: e"));
+        assert!(header_line(&m).to_string().contains("Global: f1442 | e2 | next 718f ·"));
+        m.threshold_unit = ThresholdUnit::Absolute;
+        assert!(header_line(&m).to_string().contains("Global: f1442 | e2 | next 718f ·"), "‹e› leaves the Global KPI alone");
         assert_eq!(frame_citation(&m, 1440), " @-2f");
         assert_eq!(frame_citation(&m, 1442), "");
         assert_eq!(frame_citation(&m, 1443), " @+1f");
         m.claimable_reward = Some((8_000_000_000, 1440));
         assert!(alloc_title(&m, &[]).to_string().contains("[Q] 1 @-2f"));
         m.compact_actions = false;
-        assert!(header_line(&m).to_string().contains("Global: f1442 | e"));
+        assert!(header_line(&m).to_string().contains("Global: frame 1442 | epoch 2 | next boundary in 718 frames ·"));
         assert_eq!(frame_citation(&m, 1440), " @f1440");
         for line in [help_line(&m), worker_commands_line(&m)] {
             assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
@@ -4029,22 +4647,22 @@ mod compact_action_tests {
         use quil_types::proto::node::{WorkerInfo, WorkerInfoResponse};
         let mut m = Model::new(); m.running_workers = 1;
         m.cached_worker_info = Some(WorkerInfoResponse { worker_info: vec![WorkerInfo::default()] });
-        assert_eq!(worker_counts_line(&m).to_string(), "Workers: Run 1 | Assigned 0");
+        assert_eq!(worker_counts_line(&m).to_string(), "Workers: run 1 | assigned 0");
         m.cached_worker_info = None;
-        assert!(worker_counts_line(&m).to_string().contains("Assigned 0 | Manual ?"));
+        assert!(worker_counts_line(&m).to_string().contains("assigned 0 | manual ?"));
         let mut a = super::tests::row("01", 1, 1, 1, "", ""); a.status = 2;
         a.estimated_reward = BigInt::from(8_000_000_000u64);
         let title = alloc_title(&m, &[a.clone()]).to_string();
         assert!(title.contains("[Q] loading") && title.contains("[~Q/d 60m/24h/T]"));
         assert!(!title.contains("Claimable") && !title.contains("Reward"));
-        assert!(!title.contains("Paused") && !title.contains("Δ") && !title.contains("Now "));
+        assert!(!title.contains("paused") && !title.contains("Δ") && !title.contains("] now "));
         a.status = 3;
         let paused = alloc_title(&m, &[a.clone()]).to_string();
-        assert!(paused.contains("Now 0.0/0.0/0.0 | Paused ") && !paused.contains("Δ"));
+        assert!(paused.contains("] now 0.0/0.0/0.0 | paused ") && !paused.contains("Δ"));
         a.ring = UNKNOWN_REWARD_RING;
-        assert!(alloc_title(&m, &[a]).to_string().contains("Now 0.0/0.0/0.0 | Paused -/-/-"));
+        assert!(alloc_title(&m, &[a]).to_string().contains("now 0.0/0.0/0.0 | paused -/-/-"));
         m.compact_actions = false; m.compact_units = false;
-        assert!(alloc_title(&m, &[]).to_string().contains("Paused 0.0/0.0/0.0 | Delta 0.0/0.0/0.0"));
+        assert!(alloc_title(&m, &[]).to_string().contains("paused 0.0/0.0/0.0 | delta 0.0/0.0/0.0"));
     }
 
     #[test]
@@ -4122,7 +4740,7 @@ mod compact_action_tests {
     #[test]
     fn shortcut_labels_preserve_thresholds_and_automatic_actions() {
         let mut m = Model::new(); m.compact_actions = false; m.compact_units = false;
-        m.threshold_unit = ThresholdUnit::Frames;
+        m.threshold_unit = ThresholdUnit::Absolute;
         let hint = ActionHint::at("(reject|confirm)", 123);
         assert_eq!(next_action_text(&m, &hint), "(reject|confirm)@f123");
         m.compact_actions = true;
@@ -4130,6 +4748,112 @@ mod compact_action_tests {
         assert_eq!(next_action_text(&m, &ActionHint::text("(pause|leave)")), "(P|L)");
         assert_eq!(next_action_text(&m, &ActionHint::at("renew", 123)), "renew@f123");
         assert_eq!(hint.label, "(reject|confirm)");
+    }
+
+    /// A fresh GLOBAL cadence whose 60m window measures 3600s over 191 frames
+    /// (~18.8s/frame), so 512 frames estimate ~2h41m.
+    fn global_cadence(hour: Option<(u64, u64)>, day: Option<(u64, u64)>, age: u64) -> quil_types::proto::node::FrameCadence {
+        use quil_types::proto::node::{FrameCadence, FrameWindow};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let window = |seconds, (observed_seconds, advanced_frames)| FrameWindow { window_seconds: seconds, observed_seconds, advanced_frames };
+        FrameCadence { last_observed_unix_seconds: now - age, hour: hour.map(|w| window(3600, w)), day: day.map(|w| window(86400, w)) }
+    }
+
+    /// 21:11 UTC on the second UNIX day; 2h41m later is 23:52.
+    const CLOCK: u64 = 86_400 + 21 * 3600 + 11 * 60;
+
+    #[test]
+    fn global_kpi_reads_frame_epoch_and_next_boundary() {
+        let mut m = Model::new(); m.data_loaded = true; m.epoch_length = 720;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: -");
+        m.last_received_frame = 896_608; // epoch 1245 spans 896400..897120
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f");
+        m.compact_actions = false;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames");
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640)), 0));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames, ~2h41m (~23:52 UTC)");
+        m.compact_actions = true;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f ~2h41m");
+        assert!(header_line(&m).to_string().contains("Global: f896608 | e1245 | next 512f ~2h41m ·"));
+        // Without 60m advances the 24h window (10s/frame) estimates instead.
+        m.node_global_cadence = Some(global_cadence(Some((3600, 0)), Some((7_200, 720)), 0));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f ~1h25m");
+        // A stale or missing measurement shows frames only, never a guessed time.
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640)), 600));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f");
+        m.node_global_cadence = None;
+        m.compact_actions = false;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames");
+    }
+
+    /// From an epoch's first frame a whole epoch remains; from its last, one
+    /// frame.
+    #[test]
+    fn global_kpi_next_boundary_at_an_epochs_first_and_last_frame() {
+        let mut m = Model::new(); m.data_loaded = true; m.epoch_length = 720;
+        m.node_global_cadence = Some(global_cadence(Some((3600, 360)), None, 0)); // 10s/frame
+        m.last_received_frame = 896_400;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896400 | e1245 | next 720f ~2h00m");
+        m.last_received_frame = 897_119;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f897119 | e1245 | next 1f ~<1m");
+        m.last_received_frame = 897_120;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f897120 | e1246 | next 720f ~2h00m");
+    }
+
+    /// Fields deselected under ‹b› → Top header drop out of the KPI; the
+    /// remaining ones keep their order and separators.
+    #[test]
+    fn global_kpi_fields_follow_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use super::super::update::handle_key;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new(); m.data_loaded = true; m.epoch_length = 720; m.last_received_frame = 896_608;
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        handle_key(&mut m, key(KeyCode::Char('b'))); assert!(m.column_picker_active);
+        handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
+        let row = |name: &str| m.visibility_names().iter().position(|n| n.trim() == name).unwrap();
+        let (frame, epoch, next) = (row("frame"), row("epoch"), row("next boundary"));
+        m.column_picker_cursor = frame; handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: e1245 | next 512f ~2h41m");
+        m.column_picker_cursor = next; handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: e1245");
+        m.column_picker_cursor = epoch; handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: e1245", "the last field stays");
+        m.column_picker_cursor = next; handle_key(&mut m, key(KeyCode::Char(' ')));
+        m.column_picker_cursor = epoch; handle_key(&mut m, key(KeyCode::Char(' ')));
+        m.compact_actions = false;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: next boundary in 512 frames, ~2h41m (~23:52 UTC)");
+        handle_key(&mut m, key(KeyCode::Char('a')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames, ~2h41m (~23:52 UTC)");
+    }
+
+    /// Relative thresholds count down from the received frame; expanded mode
+    /// adds the estimate from the measured GLOBAL interval.
+    #[test]
+    fn expanded_relative_thresholds_add_the_global_estimate() {
+        let mut m = Model::new(); m.epoch_length = 720; m.last_received_frame = 896_608;
+        let mut a = super::tests::row("aabb", 1, 1, 1, "", "");
+        a.next_action = ActionHint::at("(reject|confirm)", 897_120);
+        a.default_action = ActionHint::at("expire", 897_840);
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(R|Y) in 512f");
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f");
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(R|Y) in 512f", "compact mode shows frames only");
+        m.compact_actions = false; m.compact_units = false;
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(reject|confirm) in 512f (~2h41m)");
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f (~6h27m)");
+        m.threshold_unit = ThresholdUnit::Absolute;
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire@f897840");
+        m.threshold_unit = ThresholdUnit::Relative;
+        m.node_global_cadence = None;
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f");
+        m.last_received_frame = 897_120;
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(reject|confirm) now");
+        // The fixed layout grows the action columns to the estimate.
+        m.last_received_frame = 896_608; m.column_sizing = ColumnSizing::Fixed;
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        let (w, _) = alloc_col_widths(&m, 260, &[a.clone()]);
+        assert!(w[14] >= printed_width(&alloc_cell(&m, &a, 14, 0)) && w[15] >= printed_width(&alloc_cell(&m, &a, 15, 0)));
     }
     #[test]
     fn reward_windows_share_order_and_sum_each_allocations_own_cadence() {
@@ -4270,5 +4994,46 @@ mod visibility_grid_tests {
             assert!(m.column_picker_offset>0,"focused last item must scroll into view");
             assert!(text.contains("▶ [x]") || text.contains("▶   [x]"),"selected item missing: {text}");
         }
+    }
+    #[test]
+    fn prover_phases_column_is_hidden_until_the_picker_enables_it_for_both_panels() {
+        use quil_types::proto::node::ShardProverCounts;
+        use super::super::update::handle_key;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new(); m.compact_actions = false; m.compact_units = false; m.data_loaded = true;
+        let mut a = super::tests::row("aa", 7, 1, 1, "", "");
+        a.prover_counts = Some(ShardProverCounts { active: 7, ..Default::default() });
+        let mut s = super::tests::shard("bb", 0, 0);
+        s.prover_counts = Some(ShardProverCounts { active: 5, joining: 1, ..Default::default() });
+        let tables = |m: &mut Model| (render_alloc_panel(m, &[a.clone()], Rect::new(0, 0, 300, 5), None),
+            render_avail_panel(m, &[s.clone()], Rect::new(0, 0, 300, 5), None));
+        let (alloc, avail) = tables(&mut m);
+        assert!(!alloc[0].to_string().contains("ProverPhases") && !avail[0].to_string().contains("ProverPhases"));
+        assert!(!alloc[1].to_string().contains("7 active") && !avail[1].to_string().contains("5 active"));
+        // ‹b›, move to the item, ‹space›: the picker shows it unchecked, then checked.
+        let mut terminal = Terminal::new(TestBackend::new(100, 44)).unwrap();
+        handle_key(&mut m, key(KeyCode::Char('b')));
+        assert!(m.column_picker_active);
+        let item = m.visibility_names().iter().position(|&name| name == "ProverPhases").unwrap();
+        assert!(m.column_picker_cursor < item);
+        while m.column_picker_cursor < item { handle_key(&mut m, key(KeyCode::Down)); }
+        assert!(screen(&mut terminal, &mut m, 100, 44).contains("[ ] ProverPhases"));
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert!(screen(&mut terminal, &mut m, 100, 44).contains("[x] ProverPhases"));
+        handle_key(&mut m, key(KeyCode::Enter));
+        assert!(!m.column_picker_active);
+        let (alloc, avail) = tables(&mut m);
+        assert!(alloc[0].to_string().contains("ProverPhases") && avail[0].to_string().contains("ProverPhases"));
+        assert!(alloc[1].to_string().contains("7 active"), "{}", alloc[1]);
+        assert!(avail[1].to_string().contains("5 active, 1 joining"), "{}", avail[1]);
+        // The Available panel's picker toggles the same shared setting.
+        m.focus = PanelFocus::Available;
+        handle_key(&mut m, key(KeyCode::Char('b')));
+        let item = m.visibility_names().iter().position(|&name| name == "ProverPhases").unwrap();
+        while m.column_picker_cursor < item { handle_key(&mut m, key(KeyCode::Down)); }
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        handle_key(&mut m, key(KeyCode::Esc));
+        let (alloc, avail) = tables(&mut m);
+        assert!(!alloc[0].to_string().contains("ProverPhases") && !avail[0].to_string().contains("ProverPhases"));
     }
 }
